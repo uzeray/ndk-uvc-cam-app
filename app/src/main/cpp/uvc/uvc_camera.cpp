@@ -344,7 +344,7 @@ namespace uvc {
     static void tuneImageControlsLocked(int fd, int /*desiredFps*/) {
         v4l2_queryctrl qc{};
 
-        // 50Hz flicker azaltma (CH/EU)
+        // CH/EU: 50Hz flicker azaltma
         if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
             if (!setCtrlIfSupported(fd, V4L2_CID_POWER_LINE_FREQUENCY,
                                     V4L2_CID_POWER_LINE_FREQUENCY_AUTO)) {
@@ -353,7 +353,7 @@ namespace uvc {
             }
         }
 
-        // FPS düşürmesin: Auto exposure priority kapalı
+        // FPS düşmesin: AE priority kapalı
         if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
             (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0);
         }
@@ -363,21 +363,33 @@ namespace uvc {
             (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
         }
 
-        // Auto gain
-        if (queryCtrl(fd, V4L2_CID_AUTOGAIN, qc)) {
-            (void) setCtrlIfSupported(fd, V4L2_CID_AUTOGAIN, 1);
-        }
-
-        // Auto WB
+        // Auto WB açık
         (void) setCtrlIfSupported(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+
+        // Auto gain varsa aç; yoksa gain'i NÖTR bırak (50%)
+        bool autoGainOk = false;
+        if (queryCtrl(fd, V4L2_CID_AUTOGAIN, qc)) {
+            autoGainOk = setCtrlIfSupported(fd, V4L2_CID_AUTOGAIN, 1);
+        }
+        if (!autoGainOk) {
+            // Bazı cihazlar AUTOGAIN yok; patlamayı önlemek için gain'i orta noktaya çek
+            (void) setCtrlPctIfSupported(fd, V4L2_CID_GAIN, 50);
+        }
 
         // JPEG quality max
         trySetJpegQualityMax(fd);
 
-        // Eğer bazı cihazlarda auto çok patlatıyorsa, bu iki satırı AÇIP sabitleyebilirsin:
-        // (void)setCtrlPctIfSupported(fd, V4L2_CID_BRIGHTNESS, 45);
-        // (void)setCtrlPctIfSupported(fd, V4L2_CID_GAMMA, 50);
+        // --------------------
+        // NÖTR GÖRÜNTÜ PROFİLİ (patlamayı keser, back camera’ya daha yakın)
+        // --------------------
+        (void) setCtrlPctIfSupported(fd, V4L2_CID_BRIGHTNESS, 20);
+        (void) setCtrlPctIfSupported(fd, V4L2_CID_CONTRAST, 50);
+        (void) setCtrlPctIfSupported(fd, V4L2_CID_SATURATION, 90);
+        (void) setCtrlPctIfSupported(fd, V4L2_CID_GAMMA, 45);
+        (void) setCtrlPctIfSupported(fd, V4L2_CID_SHARPNESS, 50);
+
     }
+
 
 // ------------------------------------------------------------------------------
 

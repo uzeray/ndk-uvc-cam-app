@@ -51,21 +51,6 @@ namespace backcam {
 
     static void closeAllLocked();
 
-    static void trySetFrameRate(ANativeWindow *win, float fps, int32_t compatibility) {
-        if (!win) return;
-
-        void *h = dlopen("libandroid.so", RTLD_NOW);
-        if (!h) return;
-
-        using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
-        auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
-        if (fn) {
-            int32_t r = fn(win, fps, compatibility);
-            ALOGI("ANativeWindow_setFrameRate(%.2f) -> %d", fps, r);
-        }
-        dlclose(h);
-    }
-
     static bool isBackFacing(const char *cameraId) {
         if (!gMgr) return false;
 
@@ -82,6 +67,67 @@ namespace backcam {
         ACameraMetadata_free(chars);
         return back;
     }
+
+    static float getMinFocalLength(const char *cameraId) {
+        ACameraMetadata *chars = nullptr;
+        if (ACameraManager_getCameraCharacteristics(gMgr, cameraId, &chars) != ACAMERA_OK || !chars)
+            return 1e9f;
+
+        ACameraMetadata_const_entry e{};
+        float minF = 1e9f;
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &e) ==
+            ACAMERA_OK &&
+            e.count > 0) {
+            for (uint32_t i = 0; i < e.count; i++) {
+                minF = std::min(minF, e.data.f[i]);
+            }
+        }
+        ACameraMetadata_free(chars);
+        return minF;
+    }
+
+    static std::string pickWidestBackCameraId() {
+        if (!gMgr) return "";
+
+        ACameraIdList *list = nullptr;
+        if (ACameraManager_getCameraIdList(gMgr, &list) != ACAMERA_OK || !list) return "";
+
+        std::string bestId;
+        float bestF = 1e9f;
+
+        for (int i = 0; i < list->numCameras; i++) {
+            const char *id = list->cameraIds[i];
+            if (!isBackFacing(id)) continue;
+
+            float f = getMinFocalLength(id);
+            if (f < bestF) {
+                bestF = f;
+                bestId = id;
+            }
+        }
+
+        ACameraManager_deleteCameraIdList(list);
+        return bestId;
+    }
+
+
+
+    static void trySetFrameRate(ANativeWindow *win, float fps, int32_t compatibility) {
+        if (!win) return;
+
+        void *h = dlopen("libandroid.so", RTLD_NOW);
+        if (!h) return;
+
+        using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
+        auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
+        if (fn) {
+            int32_t r = fn(win, fps, compatibility);
+            ALOGI("ANativeWindow_setFrameRate(%.2f) -> %d", fps, r);
+        }
+        dlclose(h);
+    }
+
+
 
     static std::string pickBackCameraIdPrefer0() {
         if (!gMgr) return "";
@@ -377,7 +423,8 @@ namespace backcam {
         // 16:9 sabitle (SurfaceTexture defaultBufferSize var ama burada da netleştiriyoruz)
         (void) ANativeWindow_setBuffersGeometry(gWindow, kPreviewW, kPreviewH, 0);
 
-        std::string camId = pickBackCameraIdPrefer0();
+        // std::string camId = pickBackCameraIdPrefer0();
+        std::string camId = pickWidestBackCameraId();
         if (camId.empty()) {
             setLastErrorLocked("no back camera found");
             closeAllLocked();
@@ -472,5 +519,8 @@ namespace backcam {
         std::lock_guard<std::mutex> lk(gLock);
         return gLastError;
     }
+
+
+
 
 }
