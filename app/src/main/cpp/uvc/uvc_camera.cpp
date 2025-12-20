@@ -1,6 +1,9 @@
+// uvc_camera_impl.cpp
+
 #include "uvc_camera.h"
 #include "../common/logging.h"
 #include "../common/time_utils.h"
+
 #include <fcntl.h>
 #include <linux/v4l2-controls.h>
 
@@ -8,13 +11,14 @@
 #include <android/native_window.h>
 
 #include <linux/videodev2.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <errno.h>
+
 #include <cstdlib>
+#include <cstdio>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -28,6 +32,34 @@
 
 #ifndef V4L2_CID_JPEG_COMPRESSION_QUALITY
 #define V4L2_CID_JPEG_COMPRESSION_QUALITY 0x009f090d
+#endif
+
+// Bazı NDK/header kombinasyonlarında eksik olabiliyor -> güvenli fallback
+#ifndef V4L2_CID_AUTOGAIN
+#define V4L2_CID_AUTOGAIN 0x00980913
+#endif
+
+#ifndef V4L2_CID_POWER_LINE_FREQUENCY
+#define V4L2_CID_POWER_LINE_FREQUENCY 0x00980918
+#endif
+
+#ifndef V4L2_EXPOSURE_AUTO
+#define V4L2_EXPOSURE_AUTO 0
+#endif
+
+// Power line frequency enum değerleri bazı header'larda farklı isimlenebiliyor.
+// Güvenli fallback:
+#ifndef V4L2_CID_POWER_LINE_FREQUENCY_DISABLED
+#define V4L2_CID_POWER_LINE_FREQUENCY_DISABLED 0
+#endif
+#ifndef V4L2_CID_POWER_LINE_FREQUENCY_50HZ
+#define V4L2_CID_POWER_LINE_FREQUENCY_50HZ 1
+#endif
+#ifndef V4L2_CID_POWER_LINE_FREQUENCY_60HZ
+#define V4L2_CID_POWER_LINE_FREQUENCY_60HZ 2
+#endif
+#ifndef V4L2_CID_POWER_LINE_FREQUENCY_AUTO
+#define V4L2_CID_POWER_LINE_FREQUENCY_AUTO 3
 #endif
 
 // MJPG decode
@@ -63,7 +95,7 @@ namespace uvc {
     static int gW = 0;
     static int gH = 0;
 
-    // --- MJPEG latest-frame mailbox (capture hızlı QBUF için) ---
+// --- MJPEG latest-frame mailbox (capture hızlı QBUF için) ---
     static std::mutex gFrameLock;
     static std::condition_variable gFrameCv;
     static std::vector<uint8_t> gLatestJpeg;
@@ -88,6 +120,12 @@ namespace uvc {
         dlclose(h);
     }
 
+    static int xioctl(int fd, unsigned long req, void *arg) {
+        int r;
+        do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
+        return r;
+    }
+
     static bool trySetCtrl(int fd, __u32 id, int value) {
         v4l2_control c{};
         c.id = id;
@@ -101,16 +139,8 @@ namespace uvc {
 
         if (ioctl(fd, VIDIOC_QUERYCTRL, &qc) == 0) {
             int maxQ = qc.maximum;
-            if (!trySetCtrl(fd, V4L2_CID_JPEG_COMPRESSION_QUALITY, maxQ)) {
-                // her cihaz desteklemiyor
-            }
+            (void) trySetCtrl(fd, V4L2_CID_JPEG_COMPRESSION_QUALITY, maxQ);
         }
-    }
-
-    static int xioctl(int fd, unsigned long req, void *arg) {
-        int r;
-        do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
-        return r;
     }
 
     static std::string fourccToStr(uint32_t f) {
@@ -174,6 +204,8 @@ namespace uvc {
                 {V4L2_CID_GAMMA,                     "GAMMA"},
                 {V4L2_CID_AUTO_WHITE_BALANCE,        "AUTO_WB"},
                 {V4L2_CID_WHITE_BALANCE_TEMPERATURE, "WB_TEMP"},
+                {V4L2_CID_POWER_LINE_FREQUENCY,      "POWER_LINE_FREQ"},
+                {V4L2_CID_AUTOGAIN,                  "AUTOGAIN"},
         };
 
         for (auto &it: list) {
@@ -253,40 +285,101 @@ namespace uvc {
         logLarge(os.str());
     }
 
-    static void applyFpsExposureLocked(int fd, int desiredFps) {
+// ------------------- IMAGE TUNING (BRIGHTNESS/EXPOSURE/GAIN) -------------------
+
+    static int valFromPct(const v4l2_queryctrl &qc, int pct) {
+        pct = std::clamp(pct, 0, 100);
+        long long range = (long long) qc.maximum - (long long) qc.minimum;
+        long long v = (long long) qc.minimum + (range * pct) / 100LL;
+        v = std::clamp(v, (long long) qc.minimum, (long long) qc.maximum);
+
+        if (qc.step > 1) {
+            long long base = qc.minimum;
+            v = base + ((v - base) / qc.step) * qc.step;
+            v = std::clamp(v, (long long) qc.minimum, (long long) qc.maximum);
+        }
+        return (int) v;
+    }
+
+    static bool setCtrlIfSupported(int fd, __u32 id, int val) {
+        v4l2_queryctrl qc{};
+        if (!queryCtrl(fd, id, qc)) return false;
+        return setCtrl(fd, id, val);
+    }
+
+    static bool setCtrlPctIfSupported(int fd, __u32 id, int pct) {
+        v4l2_queryctrl qc{};
+        if (!queryCtrl(fd, id, qc)) return false;
+        int v = valFromPct(qc, pct);
+        return setCtrl(fd, id, v);
+    }
+
+// setupLocked içinde çağrıldığı için BURADA (önceden) tanımlı olmalı
+    static void resetTouchedControlsToDefaultsLocked(int fd) {
+        auto reset = [&](uint32_t id) {
+            v4l2_queryctrl qc{};
+            if (!queryCtrl(fd, id, qc)) return;
+            (void) setCtrl(fd, id, (int) qc.default_value);
+        };
+
+        reset(V4L2_CID_EXPOSURE_AUTO);
+        reset(V4L2_CID_EXPOSURE_AUTO_PRIORITY);
+        reset(V4L2_CID_EXPOSURE_ABSOLUTE);
+
+        reset(V4L2_CID_AUTOGAIN);
+        reset(V4L2_CID_GAIN);
+
+        reset(V4L2_CID_BRIGHTNESS);
+        reset(V4L2_CID_CONTRAST);
+        reset(V4L2_CID_SATURATION);
+        reset(V4L2_CID_GAMMA);
+        reset(V4L2_CID_SHARPNESS);
+
+        reset(V4L2_CID_AUTO_WHITE_BALANCE);
+        reset(V4L2_CID_WHITE_BALANCE_TEMPERATURE);
+
+        reset(V4L2_CID_POWER_LINE_FREQUENCY);
+    }
+
+    static void tuneImageControlsLocked(int fd, int /*desiredFps*/) {
         v4l2_queryctrl qc{};
 
-        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
-            (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0);
-        }
-
-        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc)) {
-            (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
-        }
-
-        if (queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc)) {
-            int target = qc.default_value;
-            if (desiredFps > 0) {
-                int exp100us = (int) (10000 / desiredFps);
-                target = std::clamp(exp100us, qc.minimum, qc.maximum);
-                if (desiredFps >= 60) {
-                    int bright = (int) (target * 115 / 100);
-                    target = std::clamp(bright, qc.minimum, qc.maximum);
-                }
+        // 50Hz flicker azaltma (CH/EU)
+        if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
+            if (!setCtrlIfSupported(fd, V4L2_CID_POWER_LINE_FREQUENCY,
+                                    V4L2_CID_POWER_LINE_FREQUENCY_AUTO)) {
+                (void) setCtrlIfSupported(fd, V4L2_CID_POWER_LINE_FREQUENCY,
+                                          V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
             }
-            (void) setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, target);
         }
 
-        if (queryCtrl(fd, V4L2_CID_GAIN, qc)) {
-            int up = qc.minimum + (qc.maximum - qc.minimum) * 3 / 4;
-            int target = std::clamp(up, qc.minimum, qc.maximum);
-            (void) setCtrl(fd, V4L2_CID_GAIN, target);
+        // FPS düşürmesin: Auto exposure priority kapalı
+        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
+            (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0);
         }
 
-        if (queryCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, qc)) {
-            (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+        // Exposure AUTO
+        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc)) {
+            (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
         }
+
+        // Auto gain
+        if (queryCtrl(fd, V4L2_CID_AUTOGAIN, qc)) {
+            (void) setCtrlIfSupported(fd, V4L2_CID_AUTOGAIN, 1);
+        }
+
+        // Auto WB
+        (void) setCtrlIfSupported(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+
+        // JPEG quality max
+        trySetJpegQualityMax(fd);
+
+        // Eğer bazı cihazlarda auto çok patlatıyorsa, bu iki satırı AÇIP sabitleyebilirsin:
+        // (void)setCtrlPctIfSupported(fd, V4L2_CID_BRIGHTNESS, 45);
+        // (void)setCtrlPctIfSupported(fd, V4L2_CID_GAMMA, 50);
     }
+
+// ------------------------------------------------------------------------------
 
     static bool trySetFormatLocked(int fd, int w, int h, uint32_t fourcc, v4l2_format &outFmt) {
         v4l2_format fmt{};
@@ -336,6 +429,11 @@ namespace uvc {
 
             bool isUvc = (std::strncmp((const char *) cap.driver, "uvcvideo", 7) == 0);
             if (isUvc) {
+                // LEAK FIX: daha önce tuttuğumuz fallback fd varsa kapat
+                if (fallbackFd >= 0) {
+                    close(fallbackFd);
+                    fallbackFd = -1;
+                }
                 dbg += std::string("SELECT ") + path + " driver=" + (const char *) cap.driver +
                        " card=" + (const char *) cap.card + "\n";
                 return fd;
@@ -439,6 +537,7 @@ namespace uvc {
         dumpModesLocked(gFd);
         dumpControlsLocked(gFd);
 
+        // FPS ve quality hint
         trySetFpsLocked(gFd, fps);
 
         v4l2_format fmt{};
@@ -450,8 +549,14 @@ namespace uvc {
             return false;
         }
 
+        // S_FMT sonrası bazı cihazlar ctrl resetler -> tekrar uygula
         trySetFpsLocked(gFd, fps);
-        applyFpsExposureLocked(gFd, fps);
+
+        // ÖNCE reset (bozuk state temizliği)
+        resetTouchedControlsToDefaultsLocked(gFd);
+
+        // SONRA güvenli auto tuning
+        tuneImageControlsLocked(gFd, fps);
 
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
         gChosenW.store((int) fmt.fmt.pix.width, std::memory_order_relaxed);
@@ -480,8 +585,8 @@ namespace uvc {
 
         if (xioctl(gFd, VIDIOC_REQBUFS, &req) != 0 || req.count < 4) {
             int e = errno;
-            setErrLocked(std::string("VIDIOC_REQBUFS failed errno=") + std::to_string(e) + " (" +
-                         std::strerror(e) + ")");
+            setErrLocked(std::string("VIDIOC_REQBUFS failed errno=") + std::to_string(e) +
+                         " (" + std::strerror(e) + ")");
             return false;
         }
 
@@ -496,9 +601,8 @@ namespace uvc {
 
             if (xioctl(gFd, VIDIOC_QUERYBUF, &buf) != 0) {
                 int e = errno;
-                setErrLocked(
-                        std::string("VIDIOC_QUERYBUF failed errno=") + std::to_string(e) + " (" +
-                        std::strerror(e) + ")");
+                setErrLocked(std::string("VIDIOC_QUERYBUF failed errno=") + std::to_string(e) +
+                             " (" + std::strerror(e) + ")");
                 return false;
             }
 
@@ -506,8 +610,8 @@ namespace uvc {
                            buf.m.offset);
             if (p == MAP_FAILED) {
                 int e = errno;
-                setErrLocked(std::string("mmap failed errno=") + std::to_string(e) + " (" +
-                             std::strerror(e) + ")");
+                setErrLocked(std::string("mmap failed errno=") + std::to_string(e) +
+                             " (" + std::strerror(e) + ")");
                 return false;
             }
 
@@ -516,8 +620,8 @@ namespace uvc {
 
             if (xioctl(gFd, VIDIOC_QBUF, &buf) != 0) {
                 int e = errno;
-                setErrLocked(std::string("VIDIOC_QBUF failed errno=") + std::to_string(e) + " (" +
-                             std::strerror(e) + ")");
+                setErrLocked(std::string("VIDIOC_QBUF failed errno=") + std::to_string(e) +
+                             " (" + std::strerror(e) + ")");
                 return false;
             }
         }
@@ -525,8 +629,8 @@ namespace uvc {
         v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (xioctl(gFd, VIDIOC_STREAMON, &type) != 0) {
             int e = errno;
-            setErrLocked(std::string("VIDIOC_STREAMON failed errno=") + std::to_string(e) + " (" +
-                         std::strerror(e) + ")");
+            setErrLocked(std::string("VIDIOC_STREAMON failed errno=") + std::to_string(e) +
+                         " (" + std::strerror(e) + ")");
             return false;
         }
 
@@ -538,7 +642,6 @@ namespace uvc {
                     WINDOW_FORMAT_RGBA_8888
             );
 
-            // SurfaceFlinger frame pacing için (akıcılık)
             trySetFrameRate(gWin, (float) fps,
                             (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
         }
@@ -570,8 +673,9 @@ namespace uvc {
             long long prev = gPrevFrameTsNs.exchange(ts, std::memory_order_relaxed);
             if (prev != 0 && ts > prev) {
                 double fps = 1e9 / (double) (ts - prev);
-                if (fps > 0.0 && fps < 10000.0)
+                if (fps > 0.0 && fps < 10000.0) {
                     gFpsX100.store((int) (fps * 100.0), std::memory_order_relaxed);
+                }
             }
 
             if (buf.index < gBufs.size() && buf.bytesused > 0) {
@@ -608,15 +712,15 @@ namespace uvc {
 
                 if (!gRunning.load(std::memory_order_relaxed)) break;
 
-                local = gLatestJpeg;
+                gLatestJpeg.swap(local); // KOPYA YOK
                 gHasNewFrame.store(false, std::memory_order_relaxed);
             }
 
             if (!gWin || local.empty()) continue;
 
             int outW = 0, outH = 0, outComp = 0;
-            uint8_t *rgba = stbi_load_from_memory(local.data(), (int) local.size(), &outW, &outH,
-                                                  &outComp, 4);
+            uint8_t *rgba = stbi_load_from_memory(local.data(), (int) local.size(),
+                                                  &outW, &outH, &outComp, 4);
             if (rgba && outW > 0 && outH > 0) {
                 renderRgbaToWindow(rgba, outW, outH);
             }

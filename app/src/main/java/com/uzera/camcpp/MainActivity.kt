@@ -545,3 +545,5 @@ class MainActivity : AppCompatActivity() {
     private external fun nativeGetExtLastError(): String
     private external fun nativeGetExtChosenMode(): String
 }
+
+
