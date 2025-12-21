@@ -1,146 +1,129 @@
-// uvc_camera_impl.cpp
+// uvc_camera.cpp
 
 #include "uvc_camera.h"
 #include "../common/logging.h"
 #include "../common/time_utils.h"
 
-#include <fcntl.h>
-#include <linux/v4l2-controls.h>
-
 #include <android/native_window_jni.h>
 #include <android/native_window.h>
 
-#include <linux/videodev2.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <errno.h>
 
-#include <cstdlib>
-#include <cstdio>
-#include <vector>
-#include <thread>
-#include <mutex>
+#include <linux/videodev2.h>
+#include <linux/v4l2-controls.h>
+
 #include <atomic>
-#include <cstring>
-#include <string>
-#include <sstream>
-#include <algorithm>
 #include <condition_variable>
+#include <cstring>
+#include <cmath>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <algorithm>
 #include <dlfcn.h>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #ifndef V4L2_CID_JPEG_COMPRESSION_QUALITY
 #define V4L2_CID_JPEG_COMPRESSION_QUALITY 0x009f090d
 #endif
-
-// Bazı NDK/header kombinasyonlarında eksik olabiliyor -> güvenli fallback
 #ifndef V4L2_CID_AUTOGAIN
 #define V4L2_CID_AUTOGAIN 0x00980913
-#endif
-
-#ifndef V4L2_CID_POWER_LINE_FREQUENCY
-#define V4L2_CID_POWER_LINE_FREQUENCY 0x00980918
 #endif
 
 #ifndef V4L2_EXPOSURE_AUTO
 #define V4L2_EXPOSURE_AUTO 0
 #endif
-
-// Power line frequency enum değerleri bazı header'larda farklı isimlenebiliyor.
-// Güvenli fallback:
-#ifndef V4L2_CID_POWER_LINE_FREQUENCY_DISABLED
-#define V4L2_CID_POWER_LINE_FREQUENCY_DISABLED 0
+#ifndef V4L2_EXPOSURE_MANUAL
+#define V4L2_EXPOSURE_MANUAL 1
 #endif
+
 #ifndef V4L2_CID_POWER_LINE_FREQUENCY_50HZ
 #define V4L2_CID_POWER_LINE_FREQUENCY_50HZ 1
 #endif
-#ifndef V4L2_CID_POWER_LINE_FREQUENCY_60HZ
-#define V4L2_CID_POWER_LINE_FREQUENCY_60HZ 2
-#endif
-#ifndef V4L2_CID_POWER_LINE_FREQUENCY_AUTO
-#define V4L2_CID_POWER_LINE_FREQUENCY_AUTO 3
-#endif
 
-// MJPG decode
-#include "../third_party/stb_image_impl.h"
+// ---------- AE tuning ----------
+#ifndef UVC_AE_TARGET_LUMA
+#define UVC_AE_TARGET_LUMA 122
+#endif
+#ifndef UVC_AE_TOL
+#define UVC_AE_TOL 10
+#endif
+#ifndef UVC_AE_ADJUST_INTERVAL_MS
+#define UVC_AE_ADJUST_INTERVAL_MS 120
+#endif
+#ifndef UVC_AE_MAX_EXPOSURE_US_CAP
+#define UVC_AE_MAX_EXPOSURE_US_CAP 8000
+#endif
+#ifndef UVC_AE_MIN_EXPOSURE_US_CAP
+#define UVC_AE_MIN_EXPOSURE_US_CAP 400
+#endif
 
 namespace uvc {
 
     static std::mutex gLock;
     static std::string gLastError;
 
+    static int gFd = -1;
+    static ANativeWindow *gWin = nullptr;
+
+    struct MmapBuf {
+        void *ptr = nullptr;
+        size_t len = 0;
+    };
+    static std::vector<MmapBuf> gBufs;
+
+    static std::atomic<bool> gRunning{false};
+    static std::thread gThCap;
+    static std::thread gThDec;
+
     static std::atomic<long long> gLastFrameTsNs{0};
     static std::atomic<long long> gPrevFrameTsNs{0};
     static std::atomic<int> gFpsX100{0};
-    static std::atomic<int> gChosenFps{0};
 
+    static std::atomic<int> gChosenFps{0};
     static std::atomic<uint32_t> gChosenFourcc{0};
     static std::atomic<int> gChosenW{0};
     static std::atomic<int> gChosenH{0};
 
-    struct UvcBuf {
-        void *ptr = nullptr;
-        size_t len = 0;
-    };
+    static int gW = 0, gH = 0;
 
-    static int gFd = -1;
-    static std::vector<UvcBuf> gBufs;
-    static ANativeWindow *gWin = nullptr;
-
-    static std::atomic<bool> gRunning{false};
-    static std::thread gCaptureThread;
-    static std::thread gDecodeThread;
-
-    static int gW = 0;
-    static int gH = 0;
-
-// --- MJPEG latest-frame mailbox (capture hızlı QBUF için) ---
+    // mailbox (single-latest)
     static std::mutex gFrameLock;
     static std::condition_variable gFrameCv;
-    static std::vector<uint8_t> gLatestJpeg;
-    static std::atomic<bool> gHasNewFrame{false};
+    static std::vector<uint8_t> gFrameBytes;
+    static std::atomic<bool> gFrameReady{false};
 
+    // AE state
+    struct CtrlRange {
+        bool ok = false;
+        int minV = 0, maxV = 0, step = 1, defV = 0;
+    };
+    static std::mutex gCtrlLock;
+    static CtrlRange gExpAbs{};
+    static CtrlRange gGain{};
+    static std::atomic<int> gCurExpAbs{0}; // exposure_absolute (100us)
+    static std::atomic<int> gCurGain{0};
+    static std::atomic<bool> gAeEnabled{false};
+    static std::atomic<long long> gLastAeAdjustNs{0};
+
+    // ---------- helpers ----------
     static void setErrLocked(const std::string &s) { gLastError = s; }
 
     static void clearErrLocked() { gLastError.clear(); }
-
-    static void trySetFrameRate(ANativeWindow *win, float fps, int32_t compatibility) {
-        if (!win) return;
-
-        void *h = dlopen("libandroid.so", RTLD_NOW);
-        if (!h) return;
-
-        using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
-        auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
-        if (fn) {
-            int32_t r = fn(win, fps, compatibility);
-            ALOGI("UVC ANativeWindow_setFrameRate(%.2f) -> %d", fps, r);
-        }
-        dlclose(h);
-    }
 
     static int xioctl(int fd, unsigned long req, void *arg) {
         int r;
         do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
         return r;
-    }
-
-    static bool trySetCtrl(int fd, __u32 id, int value) {
-        v4l2_control c{};
-        c.id = id;
-        c.value = value;
-        return (ioctl(fd, VIDIOC_S_CTRL, &c) == 0);
-    }
-
-    static void trySetJpegQualityMax(int fd) {
-        v4l2_queryctrl qc{};
-        qc.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
-
-        if (ioctl(fd, VIDIOC_QUERYCTRL, &qc) == 0) {
-            int maxQ = qc.maximum;
-            (void) trySetCtrl(fd, V4L2_CID_JPEG_COMPRESSION_QUALITY, maxQ);
-        }
     }
 
     static std::string fourccToStr(uint32_t f) {
@@ -151,14 +134,6 @@ namespace uvc {
         s[3] = (char) ((f >> 24) & 0xFF);
         s[4] = 0;
         return std::string(s);
-    }
-
-    static void logLarge(const std::string &text) {
-        const size_t CHUNK = 900;
-        for (size_t i = 0; i < text.size(); i += CHUNK) {
-            std::string part = text.substr(i, CHUNK);
-            ALOGI("%s", part.c_str());
-        }
     }
 
     static bool queryCtrl(int fd, __u32 id, v4l2_queryctrl &qc) {
@@ -184,294 +159,501 @@ namespace uvc {
         return xioctl(fd, VIDIOC_S_CTRL, &c) == 0;
     }
 
-    static void dumpControlsLocked(int fd) {
-        std::ostringstream os;
-        os << "UVC CTRLS:\n";
-
-        struct CtrlItem {
-            __u32 id;
-            const char *name;
-        };
-        CtrlItem list[] = {
-                {V4L2_CID_EXPOSURE_AUTO,             "EXPOSURE_AUTO"},
-                {V4L2_CID_EXPOSURE_AUTO_PRIORITY,    "EXPOSURE_AUTO_PRIORITY"},
-                {V4L2_CID_EXPOSURE_ABSOLUTE,         "EXPOSURE_ABSOLUTE"},
-                {V4L2_CID_GAIN,                      "GAIN"},
-                {V4L2_CID_BRIGHTNESS,                "BRIGHTNESS"},
-                {V4L2_CID_CONTRAST,                  "CONTRAST"},
-                {V4L2_CID_SATURATION,                "SATURATION"},
-                {V4L2_CID_SHARPNESS,                 "SHARPNESS"},
-                {V4L2_CID_GAMMA,                     "GAMMA"},
-                {V4L2_CID_AUTO_WHITE_BALANCE,        "AUTO_WB"},
-                {V4L2_CID_WHITE_BALANCE_TEMPERATURE, "WB_TEMP"},
-                {V4L2_CID_POWER_LINE_FREQUENCY,      "POWER_LINE_FREQ"},
-                {V4L2_CID_AUTOGAIN,                  "AUTOGAIN"},
-        };
-
-        for (auto &it: list) {
-            v4l2_queryctrl qc{};
-            if (!queryCtrl(fd, it.id, qc)) continue;
-
-            int cur = 0;
-            bool okCur = getCtrl(fd, it.id, cur);
-
-            os << "  " << it.name
-               << " range[" << qc.minimum << ".." << qc.maximum << "]"
-               << " step=" << qc.step
-               << " def=" << qc.default_value;
-
-            if (okCur) os << " cur=" << cur;
-            os << "\n";
-        }
-
-        logLarge(os.str());
+    static CtrlRange readRange(int fd, __u32 id) {
+        CtrlRange r{};
+        v4l2_queryctrl qc{};
+        if (!queryCtrl(fd, id, qc)) return r;
+        r.ok = true;
+        r.minV = (int) qc.minimum;
+        r.maxV = (int) qc.maximum;
+        r.step = (int) std::max<__s32>(qc.step, 1);
+        r.defV = (int) qc.default_value;
+        return r;
     }
 
-    static void dumpModesLocked(int fd) {
-        std::ostringstream os;
-        os << "UVC MODES BEGIN\n";
+    static int clampToRange(const CtrlRange &r, int v) {
+        if (!r.ok) return v;
+        v = std::clamp(v, r.minV, r.maxV);
+        if (r.step > 1) {
+            int base = r.minV;
+            v = base + ((v - base) / r.step) * r.step;
+            v = std::clamp(v, r.minV, r.maxV);
+        }
+        return v;
+    }
 
-        v4l2_fmtdesc f{};
-        std::memset(&f, 0, sizeof(f));
-        f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    static void trySetJpegQualityMax(int fd) {
+        v4l2_queryctrl qc{};
+        qc.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+        if (xioctl(fd, VIDIOC_QUERYCTRL, &qc) == 0) {
+            (void) setCtrl(fd, V4L2_CID_JPEG_COMPRESSION_QUALITY, (int) qc.maximum);
+        }
+    }
 
-        for (f.index = 0; xioctl(fd, VIDIOC_ENUM_FMT, &f) == 0; f.index++) {
-            uint32_t fourcc = f.pixelformat;
-            os << "FMT " << fourccToStr(fourcc) << " (" << (char *) f.description << ")\n";
+    static void trySetFrameRate(ANativeWindow *win, float fps) {
+        if (!win) return;
+        void *h = dlopen("libandroid.so", RTLD_NOW);
+        if (!h) return;
+        using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
+        auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
+        if (fn) {
+            (void) fn(win, fps, (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        }
+        dlclose(h);
+    }
 
-            v4l2_frmsizeenum fs{};
-            std::memset(&fs, 0, sizeof(fs));
-            fs.pixel_format = fourcc;
+    static bool isCaptureNode(int fd, v4l2_capability &cap) {
+        if (xioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) return false;
+        if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) return false;
+        if (!(cap.capabilities & V4L2_CAP_STREAMING)) return false;
+        return true;
+    }
 
-            for (fs.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) == 0; fs.index++) {
-                if (fs.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
-                    int w = (int) fs.discrete.width;
-                    int h = (int) fs.discrete.height;
-
-                    v4l2_frmivalenum fi{};
-                    std::memset(&fi, 0, sizeof(fi));
-                    fi.pixel_format = fourcc;
-                    fi.width = (uint32_t) w;
-                    fi.height = (uint32_t) h;
-
-                    os << "  " << w << "x" << h << " fps:";
-                    bool any = false;
-
-                    for (fi.index = 0;
-                         xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fi) == 0; fi.index++) {
-                        if (fi.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
-                            int num = (int) fi.discrete.numerator;
-                            int den = (int) fi.discrete.denominator;
-                            if (num > 0 && den > 0) {
-                                int fps = den / num;
-                                os << " " << fps;
-                                any = true;
-                            }
-                        } else {
-                            os << " (non-discrete)";
-                            any = true;
-                            break;
-                        }
-                    }
-                    if (!any) os << " (unknown)";
-                    os << "\n";
-                } else {
-                    os << "  (non-discrete framesize)\n";
+    static int openBestNode(std::string &dbg) {
+        int fallback = -1;
+        v4l2_capability fcap{};
+        for (int i = 0; i < 64; i++) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "/dev/video%d", i);
+            int fd = open(path, O_RDWR | O_NONBLOCK);
+            if (fd < 0) {
+                if (errno == ENOENT) continue;
+                continue;
+            }
+            v4l2_capability cap{};
+            if (!isCaptureNode(fd, cap)) {
+                close(fd);
+                continue;
+            }
+            bool isUvc = (std::strncmp((const char *) cap.driver, "uvcvideo", 7) == 0);
+            if (isUvc) {
+                dbg += std::string("SELECT ") + path + "\n";
+                if (fallback >= 0) {
+                    close(fallback);
+                    fallback = -1;
                 }
+                return fd;
+            }
+            if (fallback < 0) {
+                fallback = fd;
+                fcap = cap;
+            } else {
+                close(fd);
             }
         }
-
-        os << "UVC MODES END\n";
-        logLarge(os.str());
+        if (fallback >= 0) {
+            dbg += std::string("FALLBACK driver=") + (const char *) fcap.driver + "\n";
+        }
+        return fallback;
     }
 
-// ------------------- IMAGE TUNING (BRIGHTNESS/EXPOSURE/GAIN) -------------------
-
-    static int valFromPct(const v4l2_queryctrl &qc, int pct) {
-        pct = std::clamp(pct, 0, 100);
-        long long range = (long long) qc.maximum - (long long) qc.minimum;
-        long long v = (long long) qc.minimum + (range * pct) / 100LL;
-        v = std::clamp(v, (long long) qc.minimum, (long long) qc.maximum);
-
-        if (qc.step > 1) {
-            long long base = qc.minimum;
-            v = base + ((v - base) / qc.step) * qc.step;
-            v = std::clamp(v, (long long) qc.minimum, (long long) qc.maximum);
-        }
-        return (int) v;
-    }
-
-    static bool setCtrlIfSupported(int fd, __u32 id, int val) {
-        v4l2_queryctrl qc{};
-        if (!queryCtrl(fd, id, qc)) return false;
-        return setCtrl(fd, id, val);
-    }
-
-    static bool setCtrlPctIfSupported(int fd, __u32 id, int pct) {
-        v4l2_queryctrl qc{};
-        if (!queryCtrl(fd, id, qc)) return false;
-        int v = valFromPct(qc, pct);
-        return setCtrl(fd, id, v);
-    }
-
-// setupLocked içinde çağrıldığı için BURADA (önceden) tanımlı olmalı
-    static void resetTouchedControlsToDefaultsLocked(int fd) {
-        auto reset = [&](uint32_t id) {
-            v4l2_queryctrl qc{};
-            if (!queryCtrl(fd, id, qc)) return;
-            (void) setCtrl(fd, id, (int) qc.default_value);
-        };
-
-        reset(V4L2_CID_EXPOSURE_AUTO);
-        reset(V4L2_CID_EXPOSURE_AUTO_PRIORITY);
-        reset(V4L2_CID_EXPOSURE_ABSOLUTE);
-
-        reset(V4L2_CID_AUTOGAIN);
-        reset(V4L2_CID_GAIN);
-
-        reset(V4L2_CID_BRIGHTNESS);
-        reset(V4L2_CID_CONTRAST);
-        reset(V4L2_CID_SATURATION);
-        reset(V4L2_CID_GAMMA);
-        reset(V4L2_CID_SHARPNESS);
-
-        reset(V4L2_CID_AUTO_WHITE_BALANCE);
-        reset(V4L2_CID_WHITE_BALANCE_TEMPERATURE);
-
-        reset(V4L2_CID_POWER_LINE_FREQUENCY);
-    }
-
-    static void tuneImageControlsLocked(int fd, int /*desiredFps*/) {
-        v4l2_queryctrl qc{};
-
-        // CH/EU: 50Hz flicker azaltma
-        if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
-            if (!setCtrlIfSupported(fd, V4L2_CID_POWER_LINE_FREQUENCY,
-                                    V4L2_CID_POWER_LINE_FREQUENCY_AUTO)) {
-                (void) setCtrlIfSupported(fd, V4L2_CID_POWER_LINE_FREQUENCY,
-                                          V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
-            }
-        }
-
-        // FPS düşmesin: AE priority kapalı
-        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
-            (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0);
-        }
-
-        // Exposure AUTO
-        if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc)) {
-            (void) setCtrlIfSupported(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
-        }
-
-        // Auto WB açık
-        (void) setCtrlIfSupported(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
-
-        // Auto gain varsa aç; yoksa gain'i NÖTR bırak (50%)
-        bool autoGainOk = false;
-        if (queryCtrl(fd, V4L2_CID_AUTOGAIN, qc)) {
-            autoGainOk = setCtrlIfSupported(fd, V4L2_CID_AUTOGAIN, 1);
-        }
-        if (!autoGainOk) {
-            // Bazı cihazlar AUTOGAIN yok; patlamayı önlemek için gain'i orta noktaya çek
-            (void) setCtrlPctIfSupported(fd, V4L2_CID_GAIN, 50);
-        }
-
-        // JPEG quality max
-        trySetJpegQualityMax(fd);
-
-        // --------------------
-        // NÖTR GÖRÜNTÜ PROFİLİ (patlamayı keser, back camera’ya daha yakın)
-        // --------------------
-        (void) setCtrlPctIfSupported(fd, V4L2_CID_BRIGHTNESS, 20);
-        (void) setCtrlPctIfSupported(fd, V4L2_CID_CONTRAST, 50);
-        (void) setCtrlPctIfSupported(fd, V4L2_CID_SATURATION, 90);
-        (void) setCtrlPctIfSupported(fd, V4L2_CID_GAMMA, 45);
-        (void) setCtrlPctIfSupported(fd, V4L2_CID_SHARPNESS, 50);
-
-    }
-
-
-// ------------------------------------------------------------------------------
-
-    static bool trySetFormatLocked(int fd, int w, int h, uint32_t fourcc, v4l2_format &outFmt) {
+    static bool trySetFormat(int fd, int w, int h, uint32_t fourcc, v4l2_format &outFmt) {
         v4l2_format fmt{};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = (uint32_t) w;
         fmt.fmt.pix.height = (uint32_t) h;
         fmt.fmt.pix.pixelformat = fourcc;
         fmt.fmt.pix.field = V4L2_FIELD_ANY;
-
         if (xioctl(fd, VIDIOC_S_FMT, &fmt) != 0) return false;
         outFmt = fmt;
         return true;
     }
 
-    static bool v4l2IsCaptureNode(int fd, v4l2_capability *outCap) {
-        v4l2_capability cap{};
-        if (xioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) return false;
-        if (outCap) *outCap = cap;
-
-        if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) return false;
-        if (!(cap.capabilities & V4L2_CAP_STREAMING)) return false;
-        return true;
+    static void trySetFps(int fd, int fps) {
+        if (fps <= 0) return;
+        v4l2_streamparm p{};
+        p.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(fd, VIDIOC_G_PARM, &p) == 0) {
+            p.parm.capture.timeperframe.numerator = 1;
+            p.parm.capture.timeperframe.denominator = (uint32_t) fps;
+            (void) xioctl(fd, VIDIOC_S_PARM, &p);
+        }
     }
 
-    static int openBestNodeLocked(std::string &dbg) {
-        int fallbackFd = -1;
-        v4l2_capability fallbackCap{};
+    static int readFps(int fd, int fallback) {
+        v4l2_streamparm p{};
+        p.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(fd, VIDIOC_G_PARM, &p) == 0) {
+            int num = (int) p.parm.capture.timeperframe.numerator;
+            int den = (int) p.parm.capture.timeperframe.denominator;
+            if (num > 0 && den > 0) return den / num;
+        }
+        return fallback;
+    }
 
-        for (int i = 0; i < 64; i++) {
-            char path[64];
-            std::snprintf(path, sizeof(path), "/dev/video%d", i);
+    static inline uint8_t clamp8(int v) {
+        return (uint8_t) (v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
 
-            int fd = open(path, O_RDWR | O_NONBLOCK);
-            if (fd < 0) {
-                int e = errno;
-                if (e == ENOENT) continue;
-                dbg += std::string(path) + ": open errno=" + std::to_string(e) + " (" +
-                       std::strerror(e) + ")\n";
-                continue;
+    static int avgLumaYuyvSample(const uint8_t *yuyv, int w, int h) {
+        if (!yuyv || w <= 0 || h <= 0) return 0;
+        const int stepX = std::max(1, w / 64);
+        const int stepY = std::max(1, h / 36);
+        const int stride = w * 2;
+        long long sum = 0;
+        int cnt = 0;
+        for (int y = 0; y < h; y += stepY) {
+            const uint8_t *row = yuyv + y * stride;
+            for (int x = 0; x < w; x += stepX) {
+                sum += (int) row[2 * x];
+                cnt++;
             }
+        }
+        return cnt ? (int) (sum / cnt) : 0;
+    }
 
-            v4l2_capability cap{};
-            if (!v4l2IsCaptureNode(fd, &cap)) {
-                close(fd);
-                continue;
+    static int avgLumaRgbaSample(const uint8_t *rgba, int w, int h) {
+        if (!rgba || w <= 0 || h <= 0) return 0;
+        const int stepX = std::max(1, w / 64);
+        const int stepY = std::max(1, h / 36);
+        const int stride = w * 4;
+        long long sum = 0;
+        int cnt = 0;
+        for (int y = 0; y < h; y += stepY) {
+            const uint8_t *row = rgba + y * stride;
+            for (int x = 0; x < w; x += stepX) {
+                const uint8_t *p = row + x * 4;
+                int R = p[0], G = p[1], B = p[2];
+                int Y = (77 * R + 150 * G + 29 * B) >> 8;
+                sum += Y;
+                cnt++;
             }
+        }
+        return cnt ? (int) (sum / cnt) : 0;
+    }
 
-            bool isUvc = (std::strncmp((const char *) cap.driver, "uvcvideo", 7) == 0);
-            if (isUvc) {
-                // LEAK FIX: daha önce tuttuğumuz fallback fd varsa kapat
-                if (fallbackFd >= 0) {
-                    close(fallbackFd);
-                    fallbackFd = -1;
+    static int exposureCapAbsForFps(int fps, const CtrlRange &exp) {
+        if (!exp.ok) return 0;
+        fps = std::max(1, fps);
+        double frameUs = 1000000.0 / (double) fps;
+        int capUs = (int) std::floor(frameUs * 0.80);
+        capUs = std::clamp(capUs, UVC_AE_MIN_EXPOSURE_US_CAP, UVC_AE_MAX_EXPOSURE_US_CAP);
+        int capAbs = capUs / 100;
+        capAbs = std::clamp(capAbs, exp.minV, exp.maxV);
+        capAbs = clampToRange(exp, capAbs);
+        return capAbs;
+    }
+
+    static void autoExposureMaybeAdjust(int avgLuma) {
+        if (!gAeEnabled.load(std::memory_order_relaxed)) return;
+        if (avgLuma <= 0) return;
+
+        long long now = nowBoottimeNs();
+        long long last = gLastAeAdjustNs.load(std::memory_order_relaxed);
+        const long long interval = (long long) UVC_AE_ADJUST_INTERVAL_MS * 1000000LL;
+        if (last != 0 && (now - last) < interval) return;
+        if (!gLastAeAdjustNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+
+        const int target = UVC_AE_TARGET_LUMA;
+        const int tol = UVC_AE_TOL;
+        if (std::abs(avgLuma - target) <= tol) return;
+
+        std::lock_guard<std::mutex> lk(gCtrlLock);
+        if (gFd < 0) return;
+
+        const int fps = std::max(gChosenFps.load(std::memory_order_relaxed), 30);
+        const int expCap = exposureCapAbsForFps(fps, gExpAbs);
+
+        int curExp = gCurExpAbs.load(std::memory_order_relaxed);
+        int curGain = gCurGain.load(std::memory_order_relaxed);
+
+        if (gExpAbs.ok && curExp == 0) {
+            int v = 0;
+            if (getCtrl(gFd, V4L2_CID_EXPOSURE_ABSOLUTE, v)) curExp = v;
+        }
+        if (gGain.ok && curGain == 0) {
+            int v = 0;
+            if (getCtrl(gFd, V4L2_CID_GAIN, v)) curGain = v;
+        }
+
+        bool changed = false;
+
+        if (avgLuma > target + tol) {
+            if (gGain.ok && curGain > gGain.minV) {
+                int next = clampToRange(gGain, curGain - gGain.step);
+                if (next != curGain && setCtrl(gFd, V4L2_CID_GAIN, next)) {
+                    curGain = next;
+                    changed = true;
                 }
-                dbg += std::string("SELECT ") + path + " driver=" + (const char *) cap.driver +
-                       " card=" + (const char *) cap.card + "\n";
-                return fd;
+            } else if (gExpAbs.ok && curExp > gExpAbs.minV) {
+                int next = clampToRange(gExpAbs, curExp - gExpAbs.step);
+                if (next != curExp && setCtrl(gFd, V4L2_CID_EXPOSURE_ABSOLUTE, next)) {
+                    curExp = next;
+                    changed = true;
+                }
             }
-
-            if (fallbackFd < 0) {
-                fallbackFd = fd;
-                fallbackCap = cap;
-            } else {
-                close(fd);
+        } else if (avgLuma < target - tol) {
+            if (gExpAbs.ok && expCap > 0 && curExp < expCap) {
+                int next = std::min(curExp + gExpAbs.step, expCap);
+                next = clampToRange(gExpAbs, next);
+                if (next != curExp && setCtrl(gFd, V4L2_CID_EXPOSURE_ABSOLUTE, next)) {
+                    curExp = next;
+                    changed = true;
+                }
+            } else if (gGain.ok && curGain < gGain.maxV) {
+                int next = clampToRange(gGain, curGain + gGain.step);
+                if (next != curGain && setCtrl(gFd, V4L2_CID_GAIN, next)) {
+                    curGain = next;
+                    changed = true;
+                }
             }
         }
 
-        if (fallbackFd >= 0) {
-            dbg += std::string("FALLBACK driver=") + (const char *) fallbackCap.driver +
-                   " card=" + (const char *) fallbackCap.card + "\n";
+        if (changed) {
+            gCurExpAbs.store(curExp, std::memory_order_relaxed);
+            gCurGain.store(curGain, std::memory_order_relaxed);
         }
-        return fallbackFd;
     }
 
-    static void tearDownLocked() {
+    static void renderRgbaToWindow(const uint8_t *rgba, int w, int h) {
+        if (!gWin) return;
+        ANativeWindow_Buffer out{};
+        if (ANativeWindow_lock(gWin, &out, nullptr) != 0) return;
+
+        uint8_t *dst = (uint8_t *) out.bits;
+        int dstStride = out.stride * 4;
+        int srcStride = w * 4;
+
+        int copyH = std::min(h, out.height);
+        int copyWBytes = std::min(w, out.width) * 4;
+
+        for (int y = 0; y < copyH; y++) {
+            std::memcpy(dst + y * dstStride, rgba + y * srcStride, copyWBytes);
+            if (copyWBytes < dstStride) {
+                std::memset(dst + y * dstStride + copyWBytes, 0, (size_t) (dstStride - copyWBytes));
+            }
+        }
+        for (int y = copyH; y < out.height; y++) {
+            std::memset(dst + y * dstStride, 0, (size_t) dstStride);
+        }
+
+        ANativeWindow_unlockAndPost(gWin);
+    }
+
+    static void applyControls(int fd, int chosenFps) {
+        // 50Hz flicker (EU/TR)
+        {
+            v4l2_queryctrl qc{};
+            if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
+                (void) setCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY,
+                               V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+            }
+        }
+
+        // AE priority off (fps sabit kalsın)
+        {
+            v4l2_queryctrl qc{};
+            if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
+                (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0);
+            }
+        }
+
+        // Auto WB on
+        (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
+
+        // MJPEG quality max
+        trySetJpegQualityMax(fd);
+
+        // Manual exp + autogain off (varsa) + yazılımsal AE
+        {
+            v4l2_queryctrl qc{};
+            bool expAutoOk = queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc);
+            bool expAbsOk = queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc);
+            bool gainOk = queryCtrl(fd, V4L2_CID_GAIN, qc);
+            bool autogOk = queryCtrl(fd, V4L2_CID_AUTOGAIN, qc);
+
+            gExpAbs = readRange(fd, V4L2_CID_EXPOSURE_ABSOLUTE);
+            gGain = readRange(fd, V4L2_CID_GAIN);
+
+            if (expAutoOk && expAbsOk) {
+                (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+            }
+            if (autogOk) {
+                (void) setCtrl(fd, V4L2_CID_AUTOGAIN, 0);
+            }
+
+            const int fps = chosenFps > 0 ? chosenFps : 60;
+            const int expCap = exposureCapAbsForFps(fps, gExpAbs);
+
+            if (gExpAbs.ok && expCap > 0) {
+                int initExp = gExpAbs.minV + (expCap - gExpAbs.minV) / 2;
+                initExp = clampToRange(gExpAbs, initExp);
+                if (setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, initExp)) {
+                    gCurExpAbs.store(initExp, std::memory_order_relaxed);
+                }
+            }
+            if (gGain.ok) {
+                int initGain = gGain.minV + (gGain.maxV - gGain.minV) / 4;
+                initGain = clampToRange(gGain, initGain);
+                if (setCtrl(fd, V4L2_CID_GAIN, initGain)) {
+                    gCurGain.store(initGain, std::memory_order_relaxed);
+                }
+            }
+
+            gAeEnabled.store(gExpAbs.ok || gGain.ok, std::memory_order_relaxed);
+            (void) gainOk;
+        }
+    }
+
+    // ---- Enumerate supported sizes/fps to choose best stable mode ----
+    static std::vector<std::pair<int, int>> enumFrameSizes(int fd, uint32_t pixfmt) {
+        std::vector<std::pair<int, int>> out;
+
+        v4l2_frmsizeenum fse{};
+        fse.pixel_format = pixfmt;
+
+        for (fse.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fse) == 0; fse.index++) {
+            if (fse.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                out.emplace_back((int) fse.discrete.width, (int) fse.discrete.height);
+            } else if (fse.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
+                       fse.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+                int minW = (int) fse.stepwise.min_width;
+                int maxW = (int) fse.stepwise.max_width;
+                int minH = (int) fse.stepwise.min_height;
+                int maxH = (int) fse.stepwise.max_height;
+
+                // En büyük
+                out.emplace_back(maxW, maxH);
+
+                // Yaygın 16:9 seçeneklerini aralığa uyarsa ekle
+                const std::pair<int, int> common[] = {
+                        {3840, 2160},
+                        {2560, 1440},
+                        {1920, 1080},
+                        {1600, 900},
+                        {1280, 720},
+                        {960,  540},
+                        {640,  360},
+                        {640,  480}
+                };
+                for (auto &c: common) {
+                    if (c.first >= minW && c.first <= maxW && c.second >= minH &&
+                        c.second <= maxH) {
+                        out.emplace_back(c.first, c.second);
+                    }
+                }
+                break;
+            }
+        }
+
+        // uniq
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+    static int enumMaxFpsFor(int fd, uint32_t pixfmt, int w, int h) {
+        int best = 0;
+        v4l2_frmivalenum fie{};
+        fie.pixel_format = pixfmt;
+        fie.width = (uint32_t) w;
+        fie.height = (uint32_t) h;
+
+        for (fie.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fie) == 0; fie.index++) {
+            if (fie.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+                int num = (int) fie.discrete.numerator;
+                int den = (int) fie.discrete.denominator;
+                if (num > 0 && den > 0) {
+                    int fps = den / num;
+                    best = std::max(best, fps);
+                }
+            } else if (fie.type == V4L2_FRMIVAL_TYPE_STEPWISE ||
+                       fie.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
+                int num = (int) fie.stepwise.min.numerator;
+                int den = (int) fie.stepwise.min.denominator;
+                if (num > 0 && den > 0) {
+                    int fps = den / num;
+                    best = std::max(best, fps);
+                }
+                break;
+            }
+        }
+        return best;
+    }
+
+    struct ModeCand {
+        int w = 0;
+        int h = 0;
+        uint32_t f = 0;
+        int maxFps = 0;
+        int scoreMeet = 0; // 1 if can meet desired
+    };
+
+    static std::vector<ModeCand> buildCandidates(int fd, int desiredFps) {
+        std::vector<ModeCand> out;
+        const uint32_t fmts[] = {V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_YUYV};
+
+        for (uint32_t f: fmts) {
+            auto sizes = enumFrameSizes(fd, f);
+
+            // Eğer ENUM başarısızsa fallback liste:
+            if (sizes.empty()) {
+                const std::pair<int, int> fallback[] = {
+                        {1920, 1080},
+                        {1600, 900},
+                        {1280, 720},
+                        {1024, 576},
+                        {960,  540},
+                        {800,  600},
+                        {640,  480}
+                };
+                sizes.assign(std::begin(fallback), std::end(fallback));
+            }
+
+            for (auto &s: sizes) {
+                int w = s.first;
+                int h = s.second;
+                if (w <= 0 || h <= 0) continue;
+
+                int m = enumMaxFpsFor(fd, f, w, h);
+                // ENUM interval yoksa 0 gelir; yine de denenecek ama düşük öncelik.
+                ModeCand c{};
+                c.w = w;
+                c.h = h;
+                c.f = f;
+                c.maxFps = m;
+                c.scoreMeet = (m >= desiredFps - 2) ? 1 : 0;
+                out.push_back(c);
+            }
+        }
+
+        // uniq by (f,w,h)
+        std::sort(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
+            if (a.f != b.f) return a.f < b.f;
+            if (a.w != b.w) return a.w < b.w;
+            return a.h < b.h;
+        });
+        out.erase(std::unique(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
+            return a.f == b.f && a.w == b.w && a.h == b.h;
+        }), out.end());
+
+        // sort best-first:
+        std::sort(out.begin(), out.end(), [desiredFps](const ModeCand &a, const ModeCand &b) {
+            // 1) meets desired fps (by enum) first
+            if (a.scoreMeet != b.scoreMeet) return a.scoreMeet > b.scoreMeet;
+
+            // 2) prefer higher resolution area
+            long long aa = (long long) a.w * (long long) a.h;
+            long long bb = (long long) b.w * (long long) b.h;
+            if (aa != bb) return aa > bb;
+
+            // 3) prefer higher maxFps (if known)
+            if (a.maxFps != b.maxFps) return a.maxFps > b.maxFps;
+
+            // 4) prefer MJPEG over YUYV for stability/bandwidth
+            if (a.f != b.f) return (a.f == V4L2_PIX_FMT_MJPEG);
+
+            return false;
+        });
+
+        return out;
+    }
+
+    static void teardownLocked() {
         if (gFd >= 0) {
             v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             (void) xioctl(gFd, VIDIOC_STREAMOFF, &type);
         }
-
         for (auto &b: gBufs) {
             if (b.ptr && b.len) munmap(b.ptr, b.len);
         }
@@ -489,195 +671,186 @@ namespace uvc {
 
         {
             std::lock_guard<std::mutex> lk(gFrameLock);
-            gLatestJpeg.clear();
-            gHasNewFrame.store(false, std::memory_order_relaxed);
+            gFrameBytes.clear();
+            gFrameReady.store(false, std::memory_order_relaxed);
         }
 
         gLastFrameTsNs.store(0, std::memory_order_relaxed);
         gPrevFrameTsNs.store(0, std::memory_order_relaxed);
         gFpsX100.store(0, std::memory_order_relaxed);
+
         gChosenFps.store(0, std::memory_order_relaxed);
         gChosenFourcc.store(0, std::memory_order_relaxed);
         gChosenW.store(0, std::memory_order_relaxed);
         gChosenH.store(0, std::memory_order_relaxed);
+
+        gAeEnabled.store(false, std::memory_order_relaxed);
+        gExpAbs = {};
+        gGain = {};
+        gCurExpAbs.store(0, std::memory_order_relaxed);
+        gCurGain.store(0, std::memory_order_relaxed);
+        gLastAeAdjustNs.store(0, std::memory_order_relaxed);
+
         gW = 0;
         gH = 0;
+
+        std::lock_guard<std::mutex> lk(gLock);
+        gLastError.clear();
     }
 
-    static void renderRgbaToWindow(const uint8_t *rgba, int w, int h) {
-        if (!gWin) return;
-
-        ANativeWindow_Buffer out{};
-        if (ANativeWindow_lock(gWin, &out, nullptr) != 0) return;
-
-        uint8_t *dst = (uint8_t *) out.bits;
-        int dstStrideBytes = out.stride * 4;
-        int srcStrideBytes = w * 4;
-
-        int copyH = std::min(h, out.height);
-        int copyWBytes = std::min(w, out.width) * 4;
-
-        for (int y = 0; y < copyH; y++) {
-            std::memcpy(dst + y * dstStrideBytes, rgba + y * srcStrideBytes, copyWBytes);
-        }
-
-        ANativeWindow_unlockAndPost(gWin);
-    }
-
-    static void trySetFpsLocked(int fd, int fps) {
-        if (fps <= 0) return;
-
-        v4l2_streamparm parm{};
-        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-        if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
-            parm.parm.capture.timeperframe.numerator = 1;
-            parm.parm.capture.timeperframe.denominator = (uint32_t) fps;
-            (void) xioctl(fd, VIDIOC_S_PARM, &parm);
-        }
-
-        trySetJpegQualityMax(fd);
-    }
-
-    static bool setupLocked(int w, int h, int fps, std::string &dbgOut) {
-        gFd = openBestNodeLocked(dbgOut);
+    static bool setupLocked(int desiredFps, std::string &dbg) {
+        gFd = openBestNode(dbg);
         if (gFd < 0) {
-            setErrLocked("UVC node bulunamadi / open olmadi.\n" + dbgOut);
+            setErrLocked("UVC device open failed.\n" + dbg);
             return false;
         }
 
-        dumpModesLocked(gFd);
-        dumpControlsLocked(gFd);
+        const int want = (desiredFps > 0 ? desiredFps : 60);
 
-        // FPS ve quality hint
-        trySetFpsLocked(gFd, fps);
+        auto cands = buildCandidates(gFd, want);
 
         v4l2_format fmt{};
-        bool okFmt = trySetFormatLocked(gFd, w, h, V4L2_PIX_FMT_MJPEG, fmt);
-        if (!okFmt) {
-            int e = errno;
-            setErrLocked(std::string("VIDIOC_S_FMT(MJPG) failed errno=") + std::to_string(e) +
-                         " (" + std::strerror(e) + ")");
+        bool ok = false;
+
+        int bestGotFps = 0;
+        v4l2_format bestFmt{};
+        int bestW = 0, bestH = 0;
+        uint32_t bestFourcc = 0;
+
+        // Deneme sırası: en iyi adaydan en kötüye
+        for (const auto &c: cands) {
+            if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
+
+            // fps ayarla
+            int tryFps = want;
+            if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
+            trySetFps(gFd, tryFps);
+            trySetJpegQualityMax(gFd);
+            int got = readFps(gFd, tryFps);
+
+            // kontrol uygula (fps sabit + kalite)
+            applyControls(gFd, got);
+
+            // en iyiyi sakla
+            if (!ok || (got >= want - 2 && bestGotFps < want - 2) ||
+                ((got >= want - 2) == (bestGotFps >= want - 2) &&
+                 ((long long) fmt.fmt.pix.width * (long long) fmt.fmt.pix.height >
+                  (long long) bestW * (long long) bestH)) ||
+                ((long long) fmt.fmt.pix.width * (long long) fmt.fmt.pix.height ==
+                 (long long) bestW * (long long) bestH && got > bestGotFps)
+                    ) {
+                ok = true;
+                bestGotFps = got;
+                bestFmt = fmt;
+                bestW = (int) fmt.fmt.pix.width;
+                bestH = (int) fmt.fmt.pix.height;
+                bestFourcc = fmt.fmt.pix.pixelformat;
+
+                // hedef fps'e yeterince yakınsa ve zaten en yüksek çözünürlüklere gidiyorsak erken çık
+                if (bestGotFps >= want - 2 && c.scoreMeet == 1) {
+                    // Daha yüksek çözünürlük adayı varsa cands zaten sıralı; burada erken çıkmak mantıklı
+                    // çünkü ilk "meet+max-res" adayını yakaladık.
+                    break;
+                }
+            }
+        }
+
+        if (!ok) {
+            setErrLocked("VIDIOC_S_FMT failed (no candidate worked)");
             return false;
         }
 
-        // S_FMT sonrası bazı cihazlar ctrl resetler -> tekrar uygula
-        trySetFpsLocked(gFd, fps);
+        // Seçilen en iyi fmt'i tekrar setleyelim (bazı driverlar arada değişebiliyor)
+        (void) trySetFormat(gFd, bestW, bestH, bestFourcc, fmt);
 
-        // ÖNCE reset (bozuk state temizliği)
-        resetTouchedControlsToDefaultsLocked(gFd);
+        gChosenFps.store(bestGotFps > 0 ? bestGotFps : want, std::memory_order_relaxed);
 
-        // SONRA güvenli auto tuning
-        tuneImageControlsLocked(gFd, fps);
-
+        gW = (int) fmt.fmt.pix.width;
+        gH = (int) fmt.fmt.pix.height;
+        gChosenW.store(gW, std::memory_order_relaxed);
+        gChosenH.store(gH, std::memory_order_relaxed);
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
-        gChosenW.store((int) fmt.fmt.pix.width, std::memory_order_relaxed);
-        gChosenH.store((int) fmt.fmt.pix.height, std::memory_order_relaxed);
 
-        v4l2_streamparm parm2{};
-        parm2.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        int readFps = fps;
-        if (xioctl(gFd, VIDIOC_G_PARM, &parm2) == 0) {
-            int num = (int) parm2.parm.capture.timeperframe.numerator;
-            int den = (int) parm2.parm.capture.timeperframe.denominator;
-            if (num > 0 && den > 0) readFps = den / num;
-        }
-        gChosenFps.store(readFps, std::memory_order_relaxed);
-
-        if (fps >= 60 && readFps < 55) {
-            setErrLocked("Kamera/driver 60fps kabul etmedi. G_PARM sonucu fps=" +
-                         std::to_string(readFps));
-            return false;
-        }
-
+        // reqbufs + mmap
         v4l2_requestbuffers req{};
-        req.count = 16;
+        req.count = 12;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
-
         if (xioctl(gFd, VIDIOC_REQBUFS, &req) != 0 || req.count < 4) {
-            int e = errno;
-            setErrLocked(std::string("VIDIOC_REQBUFS failed errno=") + std::to_string(e) +
-                         " (" + std::strerror(e) + ")");
+            setErrLocked("VIDIOC_REQBUFS failed");
             return false;
         }
 
-        gBufs.clear();
-        gBufs.resize(req.count);
-
+        gBufs.assign(req.count, {});
         for (uint32_t i = 0; i < req.count; i++) {
-            v4l2_buffer buf{};
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
-            buf.index = i;
+            v4l2_buffer b{};
+            b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            b.memory = V4L2_MEMORY_MMAP;
+            b.index = i;
 
-            if (xioctl(gFd, VIDIOC_QUERYBUF, &buf) != 0) {
-                int e = errno;
-                setErrLocked(std::string("VIDIOC_QUERYBUF failed errno=") + std::to_string(e) +
-                             " (" + std::strerror(e) + ")");
+            if (xioctl(gFd, VIDIOC_QUERYBUF, &b) != 0) {
+                setErrLocked("VIDIOC_QUERYBUF failed");
                 return false;
             }
 
-            void *p = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, gFd,
-                           buf.m.offset);
+            void *p = mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, gFd, b.m.offset);
             if (p == MAP_FAILED) {
-                int e = errno;
-                setErrLocked(std::string("mmap failed errno=") + std::to_string(e) +
-                             " (" + std::strerror(e) + ")");
+                setErrLocked("mmap failed");
                 return false;
             }
-
             gBufs[i].ptr = p;
-            gBufs[i].len = buf.length;
+            gBufs[i].len = b.length;
 
-            if (xioctl(gFd, VIDIOC_QBUF, &buf) != 0) {
-                int e = errno;
-                setErrLocked(std::string("VIDIOC_QBUF failed errno=") + std::to_string(e) +
-                             " (" + std::strerror(e) + ")");
+            if (xioctl(gFd, VIDIOC_QBUF, &b) != 0) {
+                setErrLocked("VIDIOC_QBUF failed");
                 return false;
             }
         }
 
         v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (xioctl(gFd, VIDIOC_STREAMON, &type) != 0) {
-            int e = errno;
-            setErrLocked(std::string("VIDIOC_STREAMON failed errno=") + std::to_string(e) +
-                         " (" + std::strerror(e) + ")");
+            setErrLocked("VIDIOC_STREAMON failed");
             return false;
         }
 
         if (gWin) {
-            (void) ANativeWindow_setBuffersGeometry(
-                    gWin,
-                    (int) fmt.fmt.pix.width,
-                    (int) fmt.fmt.pix.height,
-                    WINDOW_FORMAT_RGBA_8888
-            );
-
-            trySetFrameRate(gWin, (float) fps,
-                            (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+            (void) ANativeWindow_setBuffersGeometry(gWin, gW, gH, WINDOW_FORMAT_RGBA_8888);
+            int fps = gChosenFps.load(std::memory_order_relaxed);
+            trySetFrameRate(gWin, (float) (fps > 0 ? fps : want));
         }
 
-        gW = (int) fmt.fmt.pix.width;
-        gH = (int) fmt.fmt.pix.height;
+        // reserve mailbox
+        {
+            std::lock_guard<std::mutex> lk(gFrameLock);
+            size_t cap = 512 * 1024;
+            if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
+                gH > 0) {
+                cap = (size_t) gW * (size_t) gH * 2;
+            } else if (gW > 0 && gH > 0) {
+                // MJPEG için de kaba bir üst sınır
+                cap = (size_t) gW * (size_t) gH; // sıkışık veri genelde bundan küçük olur
+            }
+            gFrameBytes.clear();
+            gFrameBytes.reserve(cap);
+            gFrameReady.store(false, std::memory_order_relaxed);
+        }
 
         return true;
     }
 
-    static void captureLoop() {
+    // ---------- threads ----------
+    static void capLoop() {
         while (gRunning.load(std::memory_order_relaxed)) {
             pollfd pfd{};
             pfd.fd = gFd;
             pfd.events = POLLIN;
-
             int pr = poll(&pfd, 1, 2000);
             if (pr <= 0) continue;
 
-            v4l2_buffer buf{};
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_MMAP;
-
-            if (xioctl(gFd, VIDIOC_DQBUF, &buf) != 0) continue;
+            v4l2_buffer b{};
+            b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            b.memory = V4L2_MEMORY_MMAP;
+            if (xioctl(gFd, VIDIOC_DQBUF, &b) != 0) continue;
 
             long long ts = nowBoottimeNs();
             gLastFrameTsNs.store(ts, std::memory_order_relaxed);
@@ -685,61 +858,105 @@ namespace uvc {
             long long prev = gPrevFrameTsNs.exchange(ts, std::memory_order_relaxed);
             if (prev != 0 && ts > prev) {
                 double fps = 1e9 / (double) (ts - prev);
-                if (fps > 0.0 && fps < 10000.0) {
+                if (fps > 0.0 && fps < 10000.0)
                     gFpsX100.store((int) (fps * 100.0), std::memory_order_relaxed);
-                }
             }
 
-            if (buf.index < gBufs.size() && buf.bytesused > 0) {
-                const uint8_t *src = (const uint8_t *) gBufs[buf.index].ptr;
-                int used = (int) buf.bytesused;
+            if (b.index < gBufs.size() && b.bytesused > 0) {
+                const uint8_t *src = (const uint8_t *) gBufs[b.index].ptr;
+                int used = (int) b.bytesused;
 
-                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_MJPEG) {
-                    {
-                        std::lock_guard<std::mutex> lk(gFrameLock);
-                        gLatestJpeg.resize((size_t) used);
-                        std::memcpy(gLatestJpeg.data(), src, (size_t) used);
-                        gHasNewFrame.store(true, std::memory_order_relaxed);
+                // hızlı AE ölçümü (YUYV için decode beklemeden)
+                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
+                    gH > 0) {
+                    size_t need = (size_t) gW * (size_t) gH * 2;
+                    if ((size_t) used >= need) {
+                        int avg = avgLumaYuyvSample(src, gW, gH);
+                        autoExposureMaybeAdjust(avg);
                     }
-                    gFrameCv.notify_one();
                 }
+
+                {
+                    std::lock_guard<std::mutex> lk(gFrameLock);
+                    gFrameBytes.resize((size_t) used);
+                    std::memcpy(gFrameBytes.data(), src, (size_t) used);
+                    gFrameReady.store(true, std::memory_order_relaxed);
+                }
+                gFrameCv.notify_one();
             }
 
-            (void) xioctl(gFd, VIDIOC_QBUF, &buf);
+            (void) xioctl(gFd, VIDIOC_QBUF, &b);
         }
-
         gFrameCv.notify_all();
     }
 
-    static void decodeLoop() {
+    static void decLoop() {
         std::vector<uint8_t> local;
+
+        // Reuse mats where possible to reduce allocations
+        cv::Mat rgbaReuse;
 
         while (gRunning.load(std::memory_order_relaxed)) {
             {
                 std::unique_lock<std::mutex> lk(gFrameLock);
                 gFrameCv.wait(lk, [] {
                     return !gRunning.load(std::memory_order_relaxed) ||
-                           gHasNewFrame.load(std::memory_order_relaxed);
+                           gFrameReady.load(std::memory_order_relaxed);
                 });
-
                 if (!gRunning.load(std::memory_order_relaxed)) break;
 
-                gLatestJpeg.swap(local); // KOPYA YOK
-                gHasNewFrame.store(false, std::memory_order_relaxed);
+                local.swap(gFrameBytes);
+                gFrameReady.store(false, std::memory_order_relaxed);
             }
 
             if (!gWin || local.empty()) continue;
 
-            int outW = 0, outH = 0, outComp = 0;
-            uint8_t *rgba = stbi_load_from_memory(local.data(), (int) local.size(),
-                                                  &outW, &outH, &outComp, 4);
-            if (rgba && outW > 0 && outH > 0) {
-                renderRgbaToWindow(rgba, outW, outH);
+            uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
+
+            if (f == V4L2_PIX_FMT_YUYV) {
+                if (gW > 0 && gH > 0) {
+                    size_t need = (size_t) gW * (size_t) gH * 2;
+                    if (local.size() >= need) {
+                        cv::Mat yuyv(gH, gW, CV_8UC2, local.data());
+
+                        if (rgbaReuse.empty() || rgbaReuse.cols != gW || rgbaReuse.rows != gH) {
+                            rgbaReuse = cv::Mat(gH, gW, CV_8UC4);
+                        }
+                        cv::cvtColor(yuyv, rgbaReuse, cv::COLOR_YUV2RGBA_YUY2);
+
+                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        autoExposureMaybeAdjust(avg);
+
+                        renderRgbaToWindow(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                    }
+                }
+                continue;
             }
-            if (rgba) stbi_image_free(rgba);
+
+            if (f == V4L2_PIX_FMT_MJPEG) {
+                try {
+                    cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
+                    cv::Mat bgr = cv::imdecode(buf, cv::IMREAD_COLOR);
+                    if (!bgr.empty()) {
+                        if (rgbaReuse.empty() || rgbaReuse.cols != bgr.cols ||
+                            rgbaReuse.rows != bgr.rows) {
+                            rgbaReuse = cv::Mat(bgr.rows, bgr.cols, CV_8UC4);
+                        }
+                        cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
+
+                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        autoExposureMaybeAdjust(avg);
+
+                        renderRgbaToWindow(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                    }
+                } catch (...) {
+                    // ignore decode errors
+                }
+            }
         }
     }
 
+    // ---------- public API ----------
     bool start(JNIEnv *env, jobject surface, int desiredFps) {
         std::lock_guard<std::mutex> lk(gLock);
         clearErrLocked();
@@ -747,37 +964,28 @@ namespace uvc {
         if (gRunning.load(std::memory_order_relaxed)) {
             gRunning.store(false, std::memory_order_relaxed);
             gFrameCv.notify_all();
-            if (gCaptureThread.joinable()) gCaptureThread.join();
-            if (gDecodeThread.joinable()) gDecodeThread.join();
-            tearDownLocked();
+            if (gThCap.joinable()) gThCap.join();
+            if (gThDec.joinable()) gThDec.join();
+            teardownLocked();
         }
 
         gWin = ANativeWindow_fromSurface(env, surface);
         if (!gWin) {
-            setErrLocked("ANativeWindow_fromSurface(UVC) failed");
+            setErrLocked("ANativeWindow_fromSurface failed");
             return false;
         }
-
-        int fps = (desiredFps > 0 ? desiredFps : 60);
 
         std::string dbg;
-        bool ok = setupLocked(1280, 720, fps, dbg);
-        if (!ok) {
-            std::string e1 = gLastError;
-            tearDownLocked();
-            setErrLocked(std::string("setup(1280x720 MJPG) fail:\n") + e1 + "\nDBG:\n" + dbg);
+        if (!setupLocked(desiredFps > 0 ? desiredFps : 60, dbg)) {
+            std::string e = gLastError;
+            teardownLocked();
+            setErrLocked("setup failed:\n" + e + "\n" + dbg);
             return false;
-        }
-
-        {
-            std::lock_guard<std::mutex> fl(gFrameLock);
-            gLatestJpeg.reserve(512 * 1024);
-            gHasNewFrame.store(false, std::memory_order_relaxed);
         }
 
         gRunning.store(true, std::memory_order_relaxed);
-        gCaptureThread = std::thread(captureLoop);
-        gDecodeThread = std::thread(decodeLoop);
+        gThCap = std::thread(capLoop);
+        gThDec = std::thread(decLoop);
         return true;
     }
 
@@ -788,10 +996,10 @@ namespace uvc {
         gRunning.store(false, std::memory_order_relaxed);
         gFrameCv.notify_all();
 
-        if (gCaptureThread.joinable()) gCaptureThread.join();
-        if (gDecodeThread.joinable()) gDecodeThread.join();
+        if (gThCap.joinable()) gThCap.join();
+        if (gThDec.joinable()) gThDec.join();
 
-        tearDownLocked();
+        teardownLocked();
     }
 
     long long lastFrameTimestampNs() { return gLastFrameTsNs.load(std::memory_order_relaxed); }
@@ -809,7 +1017,7 @@ namespace uvc {
         uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
         int w = gChosenW.load(std::memory_order_relaxed);
         int h = gChosenH.load(std::memory_order_relaxed);
-        if (f == 0 || w == 0 || h == 0) return "n/a";
+        if (!f || !w || !h) return "n/a";
         return fourccToStr(f) + " " + std::to_string(w) + "x" + std::to_string(h);
     }
 

@@ -1,16 +1,29 @@
 package com.uzera.camcpp
 
 import android.Manifest
-import android.content.*
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Matrix
 import android.graphics.Outline
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
-import android.view.*
+import android.text.TextUtils
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
+import android.view.ViewGroup
+import android.view.ViewOutlineProvider
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,14 +31,23 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
-import android.graphics.RectF
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        private const val TAG = "CamcppNDK"
+
+        private const val BACK_BUF_W = 1280
+        private const val BACK_BUF_H = 720
+        private const val DESIRED_FPS = 60
+
+        // Overlay refresh (1s)
+        private const val OVERLAY_INTERVAL_MS = 1000L
+
         init {
             System.loadLibrary("camcpp")
         }
@@ -53,26 +75,26 @@ class MainActivity : AppCompatActivity() {
     private val backStarting = AtomicBoolean(false)
     private val extStarting = AtomicBoolean(false)
 
-    private val camExec = Executors.newSingleThreadExecutor()
+    private val camExec: ExecutorService = Executors.newSingleThreadExecutor()
 
-    private var OVAL_DIAMETER_DP = 200f   // burayı büyüt/küçült
-    private var OVAL_GAP_DP = 20f         // iki göz arası boşluk (istersen)
+    private var OVAL_DIAMETER_DP = 200f
+    private var OVAL_GAP_DP = 20f
     private fun dp(v: Float) = (v * resources.displayMetrics.density).roundToInt()
 
-    private val choreographer by lazy { Choreographer.getInstance() }
-    private val frameCb = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val overlayRunnable = object : Runnable {
+        override fun run() {
             updateOverlay()
-            choreographer.postFrameCallback(this)
+            uiHandler.postDelayed(this, OVERLAY_INTERVAL_MS)
         }
     }
 
     private var lastSuInfo: String = ""
     private var lastSuPrepErr: String = ""
 
-    private val BACK_BUF_W = 1280
-    private val BACK_BUF_H = 720
-
+    // EXT native-chosen mode cache (avoid JNI per refresh)
+    private var extModeCache: String = ""   // e.g. "MJPG 1280x800"
+    private var extFmtCache: String = ""    // e.g. "MJPG"
     private var extBufW: Int = 1280
     private var extBufH: Int = 720
 
@@ -133,12 +155,16 @@ class MainActivity : AppCompatActivity() {
         leftOval = makeOvalContainer(leftTv)
         rightOval = makeOvalContainer(rightTv)
 
+        // === Short, 2-line overlay bar ===
         debugOverlay = TextView(this).apply {
-            textSize = 14f
-            setPadding(16, 12, 16, 12)
+            textSize = 12f
+            setPadding(12, 8, 12, 8)
             setBackgroundColor(0x66000000)
             setTextColor(0xFFFFFFFF.toInt())
-            text = "init..."
+            setSingleLine(false)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            text = "Loading..."
         }
 
         stage = FrameLayout(this).apply {
@@ -161,21 +187,24 @@ class MainActivity : AppCompatActivity() {
         root = FrameLayout(this).apply {
             addView(stage)
 
-            addView(debugOverlay)
-            debugOverlay.layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply { gravity = Gravity.TOP or Gravity.START }
+            // Overlay stays at top-left, but now only 2 lines -> won't cover ovals
+            addView(
+                debugOverlay,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                    leftMargin = dp(8f)
+                    topMargin = dp(8f)
+                }
+            )
         }
 
         setContentView(root)
 
-        leftTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            applyBackTransform()
-        }
-        rightTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            applyExtTransform()
-        }
+        leftTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBackTransform() }
+        rightTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyExtTransform() }
 
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -214,8 +243,7 @@ class MainActivity : AppCompatActivity() {
 
         rightTv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                // Burada sabit 1280x720 kalsın; gerçek mode'u native seçince extBufW/extBufH güncellenecek
-                st.setDefaultBufferSize(1280, 720)
+                st.setDefaultBufferSize(1280, 720) // initial
                 rightSurface = Surface(st)
                 layoutOvals()
                 applyExtTransform()
@@ -242,20 +270,25 @@ class MainActivity : AppCompatActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!hasPermission) reqCamPerm.launch(Manifest.permission.CAMERA)
+
+        android.util.Log.i(TAG, "OpenCV=" + nativeGetOpenCvVersion())
+        android.util.Log.i(TAG, "OpenCV smoke=" + nativeOpenCvSmokeTest())
     }
 
     override fun onResume() {
         super.onResume()
-        choreographer.postFrameCallback(frameCb)
         layoutOvals()
         applyBackTransform()
         applyExtTransform()
         maybeStartBack()
         maybeStartExt()
+
+        uiHandler.removeCallbacks(overlayRunnable)
+        uiHandler.post(overlayRunnable) // refresh every 1s
     }
 
     override fun onPause() {
-        choreographer.removeFrameCallback(frameCb)
+        uiHandler.removeCallbacks(overlayRunnable)
         stopBack()
         stopExt()
         super.onPause()
@@ -305,7 +338,6 @@ class MainActivity : AppCompatActivity() {
         applySize(leftOval)
         applySize(rightOval)
 
-        // Merkezleme noktalarını kontrol et (Göz aralığına göre %25 ve %75 idealdir)
         val cxLeft = padL + innerW * 0.25f
         val cxRight = padL + innerW * 0.75f
         val cy = padT + innerH * 0.5f
@@ -333,11 +365,9 @@ class MainActivity : AppCompatActivity() {
         val centerX = viewRect.centerX()
         val centerY = viewRect.centerY()
 
-        // normalize rotation to [0,360)
         val rot = ((rotationDegrees % 360f) + 360f) % 360f
         val rot90 = (rot == 90f || rot == 270f)
 
-        // After 90/270 rotation, buffer width/height swap for aspect math
         val contentW = if (rot90) bufH.toFloat() else bufW.toFloat()
         val contentH = if (rot90) bufW.toFloat() else bufH.toFloat()
 
@@ -346,8 +376,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         val m = Matrix()
-
-        // Camera2 sample style: base mapping
         m.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
 
         val sx = vw / bufferRect.width()
@@ -355,33 +383,18 @@ class MainActivity : AppCompatActivity() {
         val scale = if (centerCrop) maxOf(sx, sy) else minOf(sx, sy)
 
         m.postScale(scale, scale, centerX, centerY)
-
-        if (rotationDegrees != 0f) {
-            m.postRotate(rotationDegrees, centerX, centerY)
-        }
+        if (rotationDegrees != 0f) m.postRotate(rotationDegrees, centerX, centerY)
 
         tv.setTransform(m)
         tv.invalidate()
     }
 
     private fun applyBackTransform() {
-        applyAspectTransform(
-            leftTv,
-            BACK_BUF_W,
-            BACK_BUF_H,
-            rotationDegrees = BACK_ROT_DEG,
-            centerCrop = true
-        )
+        applyAspectTransform(leftTv, BACK_BUF_W, BACK_BUF_H, BACK_ROT_DEG, centerCrop = true)
     }
 
     private fun applyExtTransform() {
-        applyAspectTransform(
-            rightTv,
-            extBufW,
-            extBufH,
-            rotationDegrees = EXT_ROT_DEG,
-            centerCrop = true
-        )
+        applyAspectTransform(rightTv, extBufW, extBufH, EXT_ROT_DEG, centerCrop = true)
     }
 
     private fun updateExtBufFromModeString(mode: String) {
@@ -395,6 +408,7 @@ class MainActivity : AppCompatActivity() {
                 extBufH = h
             }
         }
+        extFmtCache = mode.trim().split(Regex("\\s+")).firstOrNull().orEmpty()
     }
 
     private fun runSu(cmd: String): Pair<Int, String> {
@@ -422,17 +436,18 @@ class MainActivity : AppCompatActivity() {
         lastSuPrepErr = ""
 
         val (idCode, idOut) = runSu("id")
-        lastSuInfo = "su(id)=$idCode ${idOut.take(80)}"
+        lastSuInfo = "su=$idCode ${idOut.take(60)}"
         if (idCode != 0) {
-            lastSuPrepErr = "SU yok/izin yok. Magisk popup gelirse GRANT et.\n$idOut"
+            lastSuPrepErr = "SU permission missing\n$idOut"
             return false
         }
 
         runSu("setenforce 0")
-        val (chCode, chOut) =
-            runSu("chmod 666 /dev/video* /dev/v4l-subdev* 2>/dev/null; ls -l /dev/video0 2>/dev/null")
+        val (chCode, chOut) = runSu(
+            "chmod 666 /dev/video* /dev/v4l-subdev* 2>/dev/null; ls -l /dev/video0 2>/dev/null"
+        )
         if (chCode != 0) {
-            lastSuPrepErr = "chmod failed: $chCode\n$chOut"
+            lastSuPrepErr = "chmod failed: $chCode"
             return false
         }
         return true
@@ -445,7 +460,7 @@ class MainActivity : AppCompatActivity() {
 
         backStarting.set(true)
         camExec.execute {
-            val ok = nativeStartBackPreview(s, 60)
+            val ok = nativeStartBackPreview(s, DESIRED_FPS)
             runOnUiThread {
                 backStarting.set(false)
                 backStarted.set(ok)
@@ -462,18 +477,20 @@ class MainActivity : AppCompatActivity() {
         extStarting.set(true)
         camExec.execute {
             val prepOk = prepareUvcAccess()
-            val ok = if (prepOk) nativeStartExternalPreview(s, 60) else false
+            val ok = if (prepOk) nativeStartExternalPreview(s, DESIRED_FPS) else false
 
-            // === FIX: native mode'u al -> extBufW/extBufH güncelle -> transform'u yeniden uygula ===
             val mode = if (ok) nativeGetExtChosenMode() else ""
 
             runOnUiThread {
                 extStarting.set(false)
                 extStarted.set(ok)
 
+                extModeCache = mode
                 if (mode.isNotBlank()) {
                     updateExtBufFromModeString(mode)
                     applyExtTransform()
+                } else {
+                    extFmtCache = ""
                 }
 
                 updateOverlay()
@@ -492,6 +509,8 @@ class MainActivity : AppCompatActivity() {
         if (!extStarted.get() && !extStarting.get()) return
         extStarted.set(false)
         extStarting.set(false)
+        extModeCache = ""
+        extFmtCache = ""
         camExec.execute { nativeStopExternalPreview() }
     }
 
@@ -501,35 +520,37 @@ class MainActivity : AppCompatActivity() {
         val bTs = nativeGetBackLastSensorTimestampNs()
         val bAgeMs = if (bTs > 0) (now - bTs) / 1_000_000.0 else -1.0
         val bFps = nativeGetBackEstimatedFpsX100() / 100.0
-        val bChosen = nativeGetBackChosenFps()
         val bErr = nativeGetBackLastError()
 
         val eTs = nativeGetExtLastSensorTimestampNs()
         val eAgeMs = if (eTs > 0) (now - eTs) / 1_000_000.0 else -1.0
         val eFps = nativeGetExtEstimatedFpsX100() / 100.0
-        val eChosen = nativeGetExtChosenFps()
         val eErr = nativeGetExtLastError()
-        val eMode = nativeGetExtChosenMode()
 
-        fun ageStr(v: Double) = if (v >= 0) String.format("%.2f ms", v) else "n/a"
+        fun ms(v: Double) = if (v >= 0) String.format("%.1f", v) else "n/a"
+        fun fps(v: Double) = if (v >= 0) String.format("%.2f", v) else "n/a"
 
-        debugOverlay.text =
-            "BACK  age=${ageStr(bAgeMs)}  fps=${String.format("%.2f", bFps)}  chosen=$bChosen\n" +
-                    (if (bErr.isNotBlank()) "BACK err=$bErr\n" else "") +
-                    "EXT   age=${ageStr(eAgeMs)}  fps=${
-                        String.format(
-                            "%.2f",
-                            eFps
-                        )
-                    }  chosen=$eChosen  mode=$eMode\n" +
-                    "EXTbuf ${extBufW}x${extBufH}\n" +
-                    (if (lastSuPrepErr.isNotBlank()) "SU/perm: $lastSuPrepErr\n" else "") +
-                    (if (eErr.isNotBlank()) "EXT  err=$eErr\n" else "") +
-                    "DBG: $lastSuInfo"
+        val backLine = buildString {
+            append("BACK  RES ${BACK_BUF_W}x${BACK_BUF_H}  FPS ${fps(bFps)}  LAT ${ms(bAgeMs)} ms")
+            if (bErr.isNotBlank()) append("  ERR")
+        }
+
+        val extRes = "${extBufW}x${extBufH}"
+        val extFmt = if (extFmtCache.isNotBlank()) extFmtCache else "EXT"
+        val extLine = buildString {
+            append("EXT   RES $extRes  FPS ${fps(eFps)}  LAT ${ms(eAgeMs)} ms  $extFmt")
+            if (eErr.isNotBlank() || lastSuPrepErr.isNotBlank()) append("  ERR")
+        }
+
+        debugOverlay.text = "$backLine\n$extLine"
     }
 
+    // ---- JNI ----
     private external fun nativeStartBackPreview(surface: Surface, desiredFps: Int): Boolean
     private external fun nativeStopBackPreview()
+
+    external fun nativeGetOpenCvVersion(): String
+    external fun nativeOpenCvSmokeTest(): String
 
     private external fun nativeStartExternalPreview(surface: Surface, desiredFps: Int): Boolean
     private external fun nativeStopExternalPreview()
@@ -545,5 +566,3 @@ class MainActivity : AppCompatActivity() {
     private external fun nativeGetExtLastError(): String
     private external fun nativeGetExtChosenMode(): String
 }
-
-

@@ -1,3 +1,5 @@
+// uvc_camera.h
+
 #pragma once
 
 #include <jni.h>

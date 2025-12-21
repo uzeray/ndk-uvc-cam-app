@@ -1,3 +1,5 @@
+// back_camera.cpp
+
 #include "back_camera.h"
 #include "../common/logging.h"
 
@@ -43,7 +45,7 @@ namespace backcam {
 
     static constexpr int kMinFps = 60;
     static constexpr int kPreviewW = 1280;
-    static constexpr int kPreviewH = 720;
+    static constexpr int kPreviewH = 800;
 
     static void setLastErrorLocked(const std::string &msg) { gLastError = msg; }
 
@@ -76,8 +78,7 @@ namespace backcam {
         ACameraMetadata_const_entry e{};
         float minF = 1e9f;
         if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &e) ==
-            ACAMERA_OK &&
-            e.count > 0) {
+            ACAMERA_OK && e.count > 0) {
             for (uint32_t i = 0; i < e.count; i++) {
                 minF = std::min(minF, e.data.f[i]);
             }
@@ -110,8 +111,6 @@ namespace backcam {
         return bestId;
     }
 
-
-
     static void trySetFrameRate(ANativeWindow *win, float fps, int32_t compatibility) {
         if (!win) return;
 
@@ -125,35 +124,6 @@ namespace backcam {
             ALOGI("ANativeWindow_setFrameRate(%.2f) -> %d", fps, r);
         }
         dlclose(h);
-    }
-
-
-
-    static std::string pickBackCameraIdPrefer0() {
-        if (!gMgr) return "";
-
-        ACameraIdList *list = nullptr;
-        if (ACameraManager_getCameraIdList(gMgr, &list) != ACAMERA_OK || !list) return "";
-
-        std::string best;
-        for (int i = 0; i < list->numCameras; i++) {
-            const char *id = list->cameraIds[i];
-            if (std::strcmp(id, "0") == 0 && isBackFacing(id)) {
-                best = id;
-                break;
-            }
-        }
-        if (best.empty()) {
-            for (int i = 0; i < list->numCameras; i++) {
-                const char *id = list->cameraIds[i];
-                if (isBackFacing(id)) {
-                    best = id;
-                    break;
-                }
-            }
-        }
-        ACameraManager_deleteCameraIdList(list);
-        return best;
     }
 
     static void onDeviceDisconnected(void *, ACameraDevice *) {
@@ -289,6 +259,7 @@ namespace backcam {
         gPrevTsNs.store(0, std::memory_order_relaxed);
         gFpsX100.store(0, std::memory_order_relaxed);
         gChosenFps.store(0, std::memory_order_relaxed);
+        gLastError.clear();
     }
 
     static bool setFpsRangeLocked(int mn, int mx) {
@@ -303,7 +274,6 @@ namespace backcam {
         return st == ACAMERA_OK;
     }
 
-    // 60fps altı kabul yok. Önce 60-60 varsa onu seç, yoksa 60 içeren range'i seç ve mümkünse 60-60'ı zorla.
     static void chooseAndApplyFpsRangeLocked(const char *camId, int desiredFps) {
         gChosenFps.store(0, std::memory_order_relaxed);
 
@@ -314,8 +284,9 @@ namespace backcam {
         ACameraMetadata_const_entry e{};
         std::vector<std::pair<int, int>> ranges;
 
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, &e)
-            == ACAMERA_OK && e.count >= 2) {
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
+                                          &e) ==
+            ACAMERA_OK && e.count >= 2) {
             for (uint32_t i = 0; i + 1 < e.count; i += 2) {
                 int mn = e.data.i32[i];
                 int mx = e.data.i32[i + 1];
@@ -324,13 +295,13 @@ namespace backcam {
         }
 
         ACameraMetadata_free(chars);
-
         if (ranges.empty()) return;
 
         const int want = std::max(kMinFps, desiredFps);
 
-        // 1) Exact fixed range (60-60)
         int chosenMin = 0, chosenMax = 0;
+
+        // 1) Exact fixed range (60-60)
         for (auto &r: ranges) {
             if (r.first == want && r.second == want) {
                 chosenMin = want;
@@ -339,7 +310,7 @@ namespace backcam {
             }
         }
 
-        // 2) Range ending at 60 (e.g. 30-60) -> pick the one with highest min (closest to fixed)
+        // 2) Range ending at 60 (e.g. 30-60) -> pick highest min
         if (chosenMax == 0) {
             int bestMn = -1;
             for (auto &r: ranges) {
@@ -353,7 +324,7 @@ namespace backcam {
             }
         }
 
-        // 3) Any range that contains 60, prefer smallest max above 60 (minimize surprise)
+        // 3) Any range that contains 60, prefer smallest max above 60
         if (chosenMax == 0) {
             int bestMax = 0;
             int bestMin = 0;
@@ -371,7 +342,7 @@ namespace backcam {
             }
         }
 
-        // 4) Fallback: highest available max (ama bu durumda 60 garanti olmayabilir)
+        // 4) Fallback: highest available max
         if (chosenMax == 0) {
             int bestMax = 0, bestMin = 0;
             for (auto &r: ranges) {
@@ -385,18 +356,70 @@ namespace backcam {
         }
 
         if (chosenMax > 0) {
-            // Önce seçilen range'i set et
             bool ok = setFpsRangeLocked(chosenMin, chosenMax);
             if (!ok) return;
 
-            // Eğer 60-60 yoksa ama 60 istiyorsak, mümkünse 60-60'ı zorla (bazı cihazlar kabul ediyor)
+            // mümkünse 60-60 zorla
             if (!(chosenMin == want && chosenMax == want) && chosenMax >= want) {
                 (void) setFpsRangeLocked(want, want);
             }
 
-            // UI'da gösterim için "hedef" fps olarak 60'ı yazmak istiyoruz
-            // (range 30-60 olsa bile hedef 60; gerçek fps overlay'de estimatedFps ile görülür)
             gChosenFps.store(want, std::memory_order_relaxed);
+        }
+    }
+
+    static void applyStabilityAndFovSettingsLocked(const char *camId) {
+        if (!gMgr || !gPreviewRequest) return;
+
+        // Anti-banding 50Hz
+        {
+            uint8_t ab = ACAMERA_CONTROL_AE_ANTIBANDING_MODE_50HZ;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AE_ANTIBANDING_MODE,
+                                               1, &ab);
+        }
+
+        // Video stabilization OFF (daraltma/warp etkilerini azaltır)
+        {
+            uint8_t vs = ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE_OFF;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest,
+                                               ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE, 1, &vs);
+        }
+
+        // Optical stabilization OFF (varsa)
+        {
+            uint8_t os = ACAMERA_LENS_OPTICAL_STABILIZATION_MODE_OFF;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest,
+                                               ACAMERA_LENS_OPTICAL_STABILIZATION_MODE, 1, &os);
+        }
+
+        // Noise/Edge FAST (fps korumak için)
+        {
+            uint8_t nr = ACAMERA_NOISE_REDUCTION_MODE_FAST;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_NOISE_REDUCTION_MODE, 1,
+                                               &nr);
+        }
+        {
+            uint8_t ed = ACAMERA_EDGE_MODE_FAST;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_EDGE_MODE, 1, &ed);
+        }
+        {
+            uint8_t ca = ACAMERA_COLOR_CORRECTION_ABERRATION_MODE_FAST;
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest,
+                                               ACAMERA_COLOR_CORRECTION_ABERRATION_MODE, 1, &ca);
+        }
+
+        // Crop region'ı aktif array'e set ederek dijital crop/zoom ihtimalini minimize et
+        ACameraMetadata *chars = nullptr;
+        if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) == ACAMERA_OK && chars) {
+            ACameraMetadata_const_entry e{};
+            if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &e) ==
+                ACAMERA_OK &&
+                e.count >= 4) {
+                int32_t crop[4] = {e.data.i32[0], e.data.i32[1], e.data.i32[2], e.data.i32[3]};
+                (void) ACaptureRequest_setEntry_i32(gPreviewRequest, ACAMERA_SCALER_CROP_REGION, 4,
+                                                    crop);
+            }
+            ACameraMetadata_free(chars);
         }
     }
 
@@ -420,10 +443,9 @@ namespace backcam {
             return false;
         }
 
-        // 16:9 sabitle (SurfaceTexture defaultBufferSize var ama burada da netleştiriyoruz)
+        // 16:9 sabitle
         (void) ANativeWindow_setBuffersGeometry(gWindow, kPreviewW, kPreviewH, 0);
 
-        // std::string camId = pickBackCameraIdPrefer0();
         std::string camId = pickWidestBackCameraId();
         if (camId.empty()) {
             setLastErrorLocked("no back camera found");
@@ -456,7 +478,7 @@ namespace backcam {
             return false;
         }
 
-        // TEMPLATE_RECORD -> genelde daha stabil yüksek fps davranışı
+        // TEMPLATE_RECORD -> yüksek fps stabil
         if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_RECORD, &gPreviewRequest) !=
             ACAMERA_OK) {
             setLastErrorLocked("createCaptureRequest failed");
@@ -484,6 +506,9 @@ namespace backcam {
             closeAllLocked();
             return false;
         }
+
+        // Stabilite/FOV ayarları
+        applyStabilityAndFovSettingsLocked(camId.c_str());
 
         // SurfaceFlinger için frame-rate hint
         trySetFrameRate(gWindow, (float) chosen,
@@ -520,7 +545,4 @@ namespace backcam {
         return gLastError;
     }
 
-
-
-
-}
+} // namespace backcam
