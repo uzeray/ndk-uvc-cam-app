@@ -73,7 +73,7 @@ class MainActivity : AppCompatActivity() {
         private const val FIXED_POS_X = 250
 
         // for circle Y position (Vertically centered: 1440/2 = 720. 720 - 500 radius = 220)
-        private const val FIXED_POS_Y = 80
+        private const val FIXED_POS_Y = 20
 
         // ==========================================
         // YENİ EKLENEN X EKSENİ GENİŞLETME AYARLARI
