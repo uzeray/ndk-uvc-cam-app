@@ -926,10 +926,9 @@ namespace uvc {
 
             uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
 
-            // [MODIFICATION START]: Calculate CROP height based on the ratio (0.35f)
+            // CROP Height (%35)
             int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
             if (cropH <= 0) cropH = 1;
-            // [MODIFICATION END]
 
             // ----------------------------------------------------------------------
             // YUYV FORMAT PROCESSING
@@ -948,35 +947,25 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // 1. CROP (KIRPMA)
+                        // 1. CROP
                         cv::Rect roi(0, 0, gW, cropH);
-                        // Güvenlik kontrolü
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
-
                         cv::Mat cropped = rgbaReuse(roi);
 
-                        // 2. SHARPENING (KESKİNLEŞTİRME) - BİRLEŞME NOKTASI İÇİN
-                        // Sadece en üst 20 pikseli işle (performans için tümünü işleme)
-                        int seamHeight = 20;
+                        // 2. [DEĞİŞİKLİK BURADA] BLURRING (YUMUŞATMA) - BİRLEŞME NOKTASI İÇİN
+                        // Sadece en üst 30 pikseli bulanıklaştırıyoruz.
+                        // (Back kamera ile birleştiği yerdeki keskin çizgiyi yok etmek için)
+                        int seamHeight = 30;
                         if (seamHeight > cropped.rows) seamHeight = cropped.rows;
 
                         cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
                         cv::Mat topStrip = cropped(topEdgeRoi);
 
-                        // Sharpening Kernel (High-pass filter)
-                        /*
-                            0  -1   0
-                           -1   5  -1
-                            0  -1   0
-                        */
-                        cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
-                                                                0, -1, 0,
-                                -1, 5, -1,
-                                0, -1, 0);
-
-                        // Filtreyi uygula
-                        cv::filter2D(topStrip, topStrip, -1, kernel);
+                        // Gaussian Blur Uygula
+                        // Size(25, 25): Bulanıklık şiddeti (Tek sayı olmalı)
+                        // 0: Standart sapma (Otomatik hesaplanır)
+                        cv::GaussianBlur(topStrip, topStrip, cv::Size(25, 25), 0);
 
                         // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
@@ -1002,30 +991,21 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // 1. CROP (KIRPMA)
-                        // MJPEG decode sonrası width değişebilir diye bgr.cols kullanıyoruz
+                        // 1. CROP
                         cv::Rect roi(0, 0, bgr.cols, cropH);
-                        // Güvenlik kontrolü
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
-
                         cv::Mat cropped = rgbaReuse(roi);
 
-                        // 2. SHARPENING (KESKİNLEŞTİRME) - BİRLEŞME NOKTASI İÇİN
-                        int seamHeight = 20;
+                        // 2. [DEĞİŞİKLİK BURADA] BLURRING (YUMUŞATMA)
+                        int seamHeight = 30;
                         if (seamHeight > cropped.rows) seamHeight = cropped.rows;
 
                         cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
                         cv::Mat topStrip = cropped(topEdgeRoi);
 
-                        // Sharpening Kernel
-                        cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
-                                                                0, -1, 0,
-                                -1, 5, -1,
-                                0, -1, 0);
-
-                        // Filtreyi uygula
-                        cv::filter2D(topStrip, topStrip, -1, kernel);
+                        // Gaussian Blur Uygula
+                        cv::GaussianBlur(topStrip, topStrip, cv::Size(25, 25), 0);
 
                         // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);

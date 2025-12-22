@@ -183,44 +183,51 @@ class MainActivity : AppCompatActivity() {
 
         // for creating circle mask container
         maskCircle = FrameLayout(this).apply {
-            // for clipping content to oval
             clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
-                    // for defining oval shape based on view size
                     outline.setOval(0, 0, view.width, view.height)
                 }
             }
             setBackgroundColor(0xFF000000.toInt())
 
-            // for linear layout to stack cameras
+            // Stack Container
             val stack = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                // for setting stack size to fixed diameter
-                layoutParams = FrameLayout.LayoutParams(
-                    FIXED_DIAMETER_PX,
-                    FIXED_DIAMETER_PX
-                )
+                layoutParams = FrameLayout.LayoutParams(FIXED_DIAMETER_PX, FIXED_DIAMETER_PX)
 
-                // for adding back camera view with fixed height
-                addView(
-                    backTv,
-                    LinearLayout.LayoutParams(
-                        FIXED_DIAMETER_PX,
-                        FIXED_BACK_H
-                    )
-                )
-                // for adding ext camera view with fixed height
-                addView(
-                    extTv,
-                    LinearLayout.LayoutParams(
-                        FIXED_DIAMETER_PX,
-                        FIXED_EXT_H
+                // 1. BACK CAMERA (Üst Kısım)
+                addView(backTv, LinearLayout.LayoutParams(FIXED_DIAMETER_PX, FIXED_BACK_H))
+
+                // 2. EXT CAMERA (Alt Kısım)
+                addView(extTv, LinearLayout.LayoutParams(FIXED_DIAMETER_PX, FIXED_EXT_H))
+            }
+            addView(stack)
+
+            // [YENİ]: DİKİŞ İZİ GİZLEYİCİ (SEAM BLENDER)
+            // Bu View, tam iki kameranın birleştiği noktaya oturur.
+            val seamBlender = View(context).apply {
+                // Arka planı yukarıdan aşağıya (Şeffaf -> Siyah -> Şeffaf) yapar.
+                // Bu, keskin çizgiyi yumuşatır.
+                background = android.graphics.drawable.GradientDrawable(
+                    android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(
+                        0x00000000, // Üst: Şeffaf
+                        0xAA000000.toInt(), // Orta: Yarı Saydam Siyah (Çizgiyi gizler)
+                        0x00000000  // Alt: Şeffaf
                     )
                 )
             }
 
-            addView(stack)
+            // Blender'ı tam arayüze yerleştiriyoruz.
+            // Yüksekliği 60px olsun (30px yukarı, 30px aşağı taşar).
+            val blenderHeight = 60
+            val params = FrameLayout.LayoutParams(FIXED_DIAMETER_PX, blenderHeight)
+
+            // Konumu: Back kameranın bittiği yerin biraz yukarısından başlasın
+            params.topMargin = FIXED_BACK_H - (blenderHeight / 2)
+
+            addView(seamBlender, params)
         }
 
         // for debug overlay text
