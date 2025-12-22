@@ -25,6 +25,7 @@ import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -34,39 +35,79 @@ import java.io.InputStreamReader
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.roundToInt
+import kotlin.math.max
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "CamcppNDK"
 
+        // for back camera buffer width
         private const val BACK_BUF_W = 1280
+
+        // for back camera buffer height
         private const val BACK_BUF_H = 720
+
+        // for target fps
         private const val DESIRED_FPS = 60
 
-        // Overlay refresh (1s)
+        // for overlay refresh interval
         private const val OVERLAY_INTERVAL_MS = 1000L
+
+        // for Pixel 7 Pro landscape screen width (3120px)
+        private const val P7P_SCREEN_W = 3120
+
+        // for Pixel 7 Pro landscape screen height (1440px)
+        private const val P7P_SCREEN_H = 1440
+
+        // for circle mask diameter (50mm lens sim on Pixel 7 Pro)
+        private const val FIXED_DIAMETER_PX = 800
+
+        // for back cam view height (top 70% of diameter)
+        private const val FIXED_BACK_H = 500
+
+        // for external camera view height (bottom 30% of diameter)
+        private const val FIXED_EXT_H = 500
+
+        // for circle X position (Left Eye Center @ 25% of 3120 = 780px. 780 - 500 radius = 280)
+        private const val FIXED_POS_X = 250
+
+        // for circle Y position (Vertically centered: 1440/2 = 720. 720 - 500 radius = 220)
+        private const val FIXED_POS_Y = 80
+
+        // ==========================================
+        // YENİ EKLENEN X EKSENİ GENİŞLETME AYARLARI
+        // ==========================================
+
+        // for modifying ONLY width (X-axis) of back camera (1.0 = normal, 1.2 = wider)
+        private const val BACK_WIDTH_SCALE = 2.5f
+
+        // for modifying ONLY width (X-axis) of ext camera (1.0 = normal, 1.2 = wider)
+        private const val EXT_WIDTH_SCALE = 3.3f
 
         init {
             System.loadLibrary("camcpp")
         }
     }
 
-    private lateinit var leftTv: TextureView
-    private lateinit var rightTv: TextureView
+    // ====== Views ======
+    private lateinit var backTv: TextureView
+    private lateinit var extTv: TextureView
     private lateinit var debugOverlay: TextView
 
     private lateinit var root: FrameLayout
     private lateinit var stage: FrameLayout
-    private lateinit var leftOval: FrameLayout
-    private lateinit var rightOval: FrameLayout
+    private lateinit var maskCircle: FrameLayout
 
-    private var leftSurface: Surface? = null
-    private var rightSurface: Surface? = null
+    // ====== Surfaces / SurfaceTextures ======
+    private var backSt: SurfaceTexture? = null
+    private var extSt: SurfaceTexture? = null
+    private var backSurface: Surface? = null
+    private var extSurface: Surface? = null
 
-    private var hasPermission = false
+    private var hasPermission = true
 
+    // Rotations
     private val BACK_ROT_DEG = -90f
     private val EXT_ROT_DEG = 0f
 
@@ -77,9 +118,14 @@ class MainActivity : AppCompatActivity() {
 
     private val camExec: ExecutorService = Executors.newSingleThreadExecutor()
 
-    private var OVAL_DIAMETER_DP = 200f
-    private var OVAL_GAP_DP = 20f
-    private fun dp(v: Float) = (v * resources.displayMetrics.density).roundToInt()
+    // for alignment enum (CENTER EKLENDİ)
+    private enum class AlignY { TOP, BOTTOM, CENTER }
+
+    // for zoom multiplier back (1.0 = no zoom)
+    private val BACK_ZOOM_MUL = 1.00f
+
+    // for zoom multiplier ext (1.0 = no zoom)
+    private val EXT_ZOOM_MUL = 1.00f
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val overlayRunnable = object : Runnable {
@@ -89,14 +135,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private var lastSuInfo: String = ""
-    private var lastSuPrepErr: String = ""
-
-    // EXT native-chosen mode cache (avoid JNI per refresh)
-    private var extModeCache: String = ""   // e.g. "MJPG 1280x800"
-    private var extFmtCache: String = ""    // e.g. "MJPG"
+    // EXT native-chosen mode cache
+    private var extModeCache: String = ""
+    private var extFmtCache: String = ""
     private var extBufW: Int = 1280
     private var extBufH: Int = 720
+
+    private var lastSuInfo: String = ""
+    private var lastSuPrepErr: String = ""
 
     private val reqCamPerm = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -115,7 +161,7 @@ class MainActivity : AppCompatActivity() {
                         prepareUvcAccess()
                         runOnUiThread {
                             stopExt()
-                            rightTv.postDelayed({ maybeStartExt() }, 200)
+                            extTv.postDelayed({ maybeStartExt() }, 200)
                         }
                     }
                 }
@@ -126,36 +172,58 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // for hiding status bar
         supportActionBar?.hide()
+        // for keeping screen on
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        leftTv = TextureView(this)
-        rightTv = TextureView(this)
+        // for creating texture views
+        backTv = TextureView(this)
+        extTv = TextureView(this)
 
-        fun makeOvalContainer(tv: TextureView): FrameLayout {
-            return FrameLayout(this).apply {
-                clipToOutline = true
-                outlineProvider = object : ViewOutlineProvider() {
-                    override fun getOutline(view: View, outline: Outline) {
-                        outline.setOval(0, 0, view.width, view.height)
-                    }
+        // for creating circle mask container
+        maskCircle = FrameLayout(this).apply {
+            // for clipping content to oval
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    // for defining oval shape based on view size
+                    outline.setOval(0, 0, view.width, view.height)
                 }
-                setBackgroundColor(0xFF000000.toInt())
+            }
+            setBackgroundColor(0xFF000000.toInt())
 
+            // for linear layout to stack cameras
+            val stack = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                // for setting stack size to fixed diameter
+                layoutParams = FrameLayout.LayoutParams(
+                    FIXED_DIAMETER_PX,
+                    FIXED_DIAMETER_PX
+                )
+
+                // for adding back camera view with fixed height
                 addView(
-                    tv,
-                    FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT
+                    backTv,
+                    LinearLayout.LayoutParams(
+                        FIXED_DIAMETER_PX,
+                        FIXED_BACK_H
+                    )
+                )
+                // for adding ext camera view with fixed height
+                addView(
+                    extTv,
+                    LinearLayout.LayoutParams(
+                        FIXED_DIAMETER_PX,
+                        FIXED_EXT_H
                     )
                 )
             }
+
+            addView(stack)
         }
 
-        leftOval = makeOvalContainer(leftTv)
-        rightOval = makeOvalContainer(rightTv)
-
-        // === Short, 2-line overlay bar ===
+        // for debug overlay text
         debugOverlay = TextView(this).apply {
             textSize = 12f
             setPadding(12, 8, 12, 8)
@@ -167,44 +235,47 @@ class MainActivity : AppCompatActivity() {
             text = "Loading..."
         }
 
+        // for stage container using Pixel 7 Pro resolution
         stage = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
+                P7P_SCREEN_W,
+                P7P_SCREEN_H
             )
-            setPadding(24, 24, 24, 24)
 
-            addView(leftOval)
-            addView(rightOval)
+            addView(maskCircle)
 
+            // for positioning mask when layout happens
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-                layoutOvals()
+                layoutMaskCircle()
+                // Transforms are called here too to ensure matrix is set
                 applyBackTransform()
                 applyExtTransform()
             }
         }
 
+        // for root frame
         root = FrameLayout(this).apply {
             addView(stage)
 
-            // Overlay stays at top-left, but now only 2 lines -> won't cover ovals
             addView(
                 debugOverlay,
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    leftMargin = dp(8f)
-                    topMargin = dp(8f)
+                    // for placing debug text on Top-Right
+                    gravity = Gravity.TOP or Gravity.END
+                    rightMargin = 24
+                    topMargin = 24
                 }
             )
         }
 
         setContentView(root)
 
-        leftTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBackTransform() }
-        rightTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyExtTransform() }
+        // for view layout changes triggers
+        backTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBackTransform() }
+        extTv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyExtTransform() }
 
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -217,48 +288,56 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(usbReceiver, filter)
         }
 
-        leftTv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+        // for back camera surface listener
+        backTv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                backSt = st
                 st.setDefaultBufferSize(BACK_BUF_W, BACK_BUF_H)
-                leftSurface = Surface(st)
-                layoutOvals()
+                backSurface = Surface(st)
+
+                layoutMaskCircle()
                 applyBackTransform()
                 maybeStartBack()
             }
 
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
-                layoutOvals()
+                layoutMaskCircle()
                 applyBackTransform()
             }
 
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                 stopBack()
-                leftSurface?.release()
-                leftSurface = null
+                backSurface?.release()
+                backSurface = null
+                backSt = null
                 return true
             }
 
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
 
-        rightTv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+        // for ext camera surface listener
+        extTv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                st.setDefaultBufferSize(1280, 720) // initial
-                rightSurface = Surface(st)
-                layoutOvals()
+                extSt = st
+                st.setDefaultBufferSize(extBufW, extBufH)
+                extSurface = Surface(st)
+
+                layoutMaskCircle()
                 applyExtTransform()
                 maybeStartExt()
             }
 
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
-                layoutOvals()
+                layoutMaskCircle()
                 applyExtTransform()
             }
 
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                 stopExt()
-                rightSurface?.release()
-                rightSurface = null
+                extSurface?.release()
+                extSurface = null
+                extSt = null
                 return true
             }
 
@@ -270,25 +349,25 @@ class MainActivity : AppCompatActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!hasPermission) reqCamPerm.launch(Manifest.permission.CAMERA)
-
-        android.util.Log.i(TAG, "OpenCV=" + nativeGetOpenCvVersion())
-        android.util.Log.i(TAG, "OpenCV smoke=" + nativeOpenCvSmokeTest())
     }
 
     override fun onResume() {
         super.onResume()
-        layoutOvals()
+
+        layoutMaskCircle()
         applyBackTransform()
         applyExtTransform()
+
         maybeStartBack()
         maybeStartExt()
 
         uiHandler.removeCallbacks(overlayRunnable)
-        uiHandler.post(overlayRunnable) // refresh every 1s
+        uiHandler.post(overlayRunnable)
     }
 
     override fun onPause() {
         uiHandler.removeCallbacks(overlayRunnable)
+
         stopBack()
         stopExt()
         super.onPause()
@@ -303,100 +382,144 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun layoutOvals() {
-        val w = stage.width
-        val h = stage.height
-        if (w == 0 || h == 0) return
+    // for setting exact pixel position and size for the circle
+    private fun layoutMaskCircle() {
+        // for hardcoded circle width
+        val w = FIXED_DIAMETER_PX
+        // for hardcoded circle height
+        val h = FIXED_DIAMETER_PX
 
-        val padL = stage.paddingLeft
-        val padR = stage.paddingRight
-        val padT = stage.paddingTop
-        val padB = stage.paddingBottom
+        val lp = maskCircle.layoutParams as? FrameLayout.LayoutParams
+            ?: FrameLayout.LayoutParams(w, h)
 
-        val innerW = (w - padL - padR).toFloat()
-        val innerH = (h - padT - padB).toFloat()
-        if (innerW <= 0f || innerH <= 0f) return
-
-        val desired = dp(OVAL_DIAMETER_DP)
-        val gapPx = dp(OVAL_GAP_DP)
-
-        val maxByH = innerH.toInt()
-        val maxByW = ((innerW - gapPx) / 2f).toInt()
-
-        val size = minOf(desired, maxByH, maxByW).coerceAtLeast(1)
-
-        fun applySize(v: View) {
-            val lp = v.layoutParams as? FrameLayout.LayoutParams
-                ?: FrameLayout.LayoutParams(size, size)
-            if (lp.width != size || lp.height != size) {
-                lp.width = size
-                lp.height = size
-                v.layoutParams = lp
-            }
+        if (lp.width != w || lp.height != h) {
+            lp.width = w
+            lp.height = h
+            maskCircle.layoutParams = lp
         }
 
-        applySize(leftOval)
-        applySize(rightOval)
-
-        val cxLeft = padL + innerW * 0.25f
-        val cxRight = padL + innerW * 0.75f
-        val cy = padT + innerH * 0.5f
-
-        leftOval.x = cxLeft - size / 2f
-        leftOval.y = cy - size / 2f
-
-        rightOval.x = cxRight - size / 2f
-        rightOval.y = cy - size / 2f
+        // for hardcoded X position (Left Eye 25%)
+        maskCircle.x = FIXED_POS_X.toFloat()
+        // for hardcoded Y position
+        maskCircle.y = FIXED_POS_Y.toFloat()
     }
 
-    private fun applyAspectTransform(
+    // for calculating transformation matrix using FIXED values
+    private fun applyTransform(
         tv: TextureView,
         bufW: Int,
         bufH: Int,
         rotationDegrees: Float,
-        centerCrop: Boolean
+        alignY: AlignY,
+        zoomMul: Float,
+        mirrorX: Boolean,
+        targetW: Int, // for passing hardcoded view width
+        targetH: Int,  // for passing hardcoded view height
+        extraScaleX: Float // NEW: for stretching/squashing width ONLY
     ) {
-        val vw = tv.width.toFloat()
-        val vh = tv.height.toFloat()
-        if (vw <= 0f || vh <= 0f) return
-        if (bufW <= 0 || bufH <= 0) return
+        // for hardcoded target width (cast to float)
+        val vw = targetW.toFloat()
+        // for hardcoded target height (cast to float)
+        val vh = targetH.toFloat()
 
-        val viewRect = RectF(0f, 0f, vw, vh)
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
+        if (bufW <= 0 || bufH <= 0) return
 
         val rot = ((rotationDegrees % 360f) + 360f) % 360f
         val rot90 = (rot == 90f || rot == 270f)
 
-        val contentW = if (rot90) bufH.toFloat() else bufW.toFloat()
-        val contentH = if (rot90) bufW.toFloat() else bufH.toFloat()
+        val srcW = bufW.toFloat()
+        val srcH = bufH.toFloat()
 
-        val bufferRect = RectF(0f, 0f, contentW, contentH).apply {
-            offset(centerX - centerX(), centerY - centerY())
-        }
+        // for effective width after rotation
+        val effW = if (rot90) srcH else srcW
+        // for effective height after rotation
+        val effH = if (rot90) srcW else srcH
+
+        // for scale calculation: match WIDTH of the circle
+        var scale = vw / effW
+
+        // for optional zoom
+        scale *= zoomMul
 
         val m = Matrix()
-        m.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
 
-        val sx = vw / bufferRect.width()
-        val sy = vh / bufferRect.height()
-        val scale = if (centerCrop) maxOf(sx, sy) else minOf(sx, sy)
+        // for centering source image
+        m.postTranslate(-srcW / 2f, -srcH / 2f)
 
-        m.postScale(scale, scale, centerX, centerY)
-        if (rotationDegrees != 0f) m.postRotate(rotationDegrees, centerX, centerY)
+        // for rotating image
+        if (rot != 0f) m.postRotate(rot)
+
+        // for mirroring X axis if needed AND applying extra width scale
+        // NOTE: X scale is multiplied by extraScaleX to stretch/squash horizontally
+        val finalSx = (if (mirrorX) -scale else scale) * extraScaleX
+        val finalSy = scale
+        m.postScale(finalSx, finalSy)
+
+        // for moving to center of the view (X is centered by default)
+        m.postTranslate(vw / 2f, vh / 2f)
+
+        // for calculating actual rendered height
+        val renderedHeight = effH * scale
+
+        // for calculating alignment offset
+        val dy = when (alignY) {
+            AlignY.TOP -> {
+                // for aligning image top to view top
+                (renderedHeight - vh) / 2f
+            }
+
+            AlignY.BOTTOM -> {
+                // for aligning image bottom to view bottom
+                -(renderedHeight - vh) / 2f
+            }
+
+            AlignY.CENTER -> {
+                // for centering vertically (no shift needed as we are already centered)
+                0f
+            }
+        }
+
+        // for applying alignment shift
+        m.postTranslate(0f, dy)
 
         tv.setTransform(m)
+        // for invalidating view to redraw
         tv.invalidate()
     }
 
+    // for applying back camera transform using fixed constants
     private fun applyBackTransform() {
-        applyAspectTransform(leftTv, BACK_BUF_W, BACK_BUF_H, BACK_ROT_DEG, centerCrop = true)
+        applyTransform(
+            tv = backTv,
+            bufW = BACK_BUF_W,
+            bufH = BACK_BUF_H,
+            rotationDegrees = BACK_ROT_DEG,
+            alignY = AlignY.BOTTOM, // for aligning to bottom
+            zoomMul = BACK_ZOOM_MUL,
+            mirrorX = false, // for mirroring back camera
+            targetW = FIXED_DIAMETER_PX, // for passing fixed width
+            targetH = FIXED_BACK_H,       // for passing fixed height
+            extraScaleX = BACK_WIDTH_SCALE // NEW: pass width scale
+        )
     }
 
+    // for applying ext camera transform using fixed constants
     private fun applyExtTransform() {
-        applyAspectTransform(rightTv, extBufW, extBufH, EXT_ROT_DEG, centerCrop = true)
+        applyTransform(
+            tv = extTv,
+            bufW = extBufW,
+            bufH = extBufH,
+            rotationDegrees = EXT_ROT_DEG,
+            alignY = AlignY.TOP, // for aligning to top
+            zoomMul = EXT_ZOOM_MUL,
+            mirrorX = false, // for no mirror on ext
+            targetW = FIXED_DIAMETER_PX, // for passing fixed width
+            targetH = FIXED_EXT_H,        // for passing fixed height
+            extraScaleX = EXT_WIDTH_SCALE // NEW: pass width scale
+        )
     }
 
+    // for parsing mode string
     private fun updateExtBufFromModeString(mode: String) {
         val m = Regex("""(\d+)\s*x\s*(\d+)""").find(mode)
             ?: Regex("""(\d+)x(\d+)""").find(mode)
@@ -411,6 +534,7 @@ class MainActivity : AppCompatActivity() {
         extFmtCache = mode.trim().split(Regex("\\s+")).firstOrNull().orEmpty()
     }
 
+    // for running shell command
     private fun runSu(cmd: String): Pair<Int, String> {
         return try {
             val p = ProcessBuilder("su", "-c", cmd)
@@ -432,6 +556,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // for preparing permissions
     private fun prepareUvcAccess(): Boolean {
         lastSuPrepErr = ""
 
@@ -443,7 +568,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         runSu("setenforce 0")
-        val (chCode, chOut) = runSu(
+        val (chCode, _) = runSu(
             "chmod 666 /dev/video* /dev/v4l-subdev* 2>/dev/null; ls -l /dev/video0 2>/dev/null"
         )
         if (chCode != 0) {
@@ -453,8 +578,9 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
+    // for starting back camera
     private fun maybeStartBack() {
-        val s = leftSurface ?: return
+        val s = backSurface ?: return
         if (!hasPermission) return
         if (backStarted.get() || backStarting.get()) return
 
@@ -469,8 +595,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // for starting ext camera
     private fun maybeStartExt() {
-        val s = rightSurface ?: return
+        val s = extSurface ?: return
         if (!hasPermission) return
         if (extStarted.get() || extStarting.get()) return
 
@@ -478,7 +605,6 @@ class MainActivity : AppCompatActivity() {
         camExec.execute {
             val prepOk = prepareUvcAccess()
             val ok = if (prepOk) nativeStartExternalPreview(s, DESIRED_FPS) else false
-
             val mode = if (ok) nativeGetExtChosenMode() else ""
 
             runOnUiThread {
@@ -488,16 +614,18 @@ class MainActivity : AppCompatActivity() {
                 extModeCache = mode
                 if (mode.isNotBlank()) {
                     updateExtBufFromModeString(mode)
+                    // for buffer size update
+                    extSt?.setDefaultBufferSize(extBufW, extBufH)
                     applyExtTransform()
                 } else {
                     extFmtCache = ""
                 }
-
                 updateOverlay()
             }
         }
     }
 
+    // for stopping back camera
     private fun stopBack() {
         if (!backStarted.get() && !backStarting.get()) return
         backStarted.set(false)
@@ -505,6 +633,7 @@ class MainActivity : AppCompatActivity() {
         camExec.execute { nativeStopBackPreview() }
     }
 
+    // for stopping ext camera
     private fun stopExt() {
         if (!extStarted.get() && !extStarting.get()) return
         extStarted.set(false)
@@ -514,6 +643,7 @@ class MainActivity : AppCompatActivity() {
         camExec.execute { nativeStopExternalPreview() }
     }
 
+    // for updating debug overlay
     private fun updateOverlay() {
         val now = SystemClock.elapsedRealtimeNanos()
 
@@ -557,12 +687,10 @@ class MainActivity : AppCompatActivity() {
 
     private external fun nativeGetBackLastSensorTimestampNs(): Long
     private external fun nativeGetBackEstimatedFpsX100(): Int
-    private external fun nativeGetBackChosenFps(): Int
     private external fun nativeGetBackLastError(): String
 
     private external fun nativeGetExtLastSensorTimestampNs(): Long
     private external fun nativeGetExtEstimatedFpsX100(): Int
-    private external fun nativeGetExtChosenFps(): Int
     private external fun nativeGetExtLastError(): String
     private external fun nativeGetExtChosenMode(): String
 }

@@ -20,11 +20,13 @@ target_include_directories(camcpp PRIVATE
 find_library(log-lib log)
 find_library(android-lib android)
 find_library(dl-lib dl)
+find_library(jnigraphics-lib jnigraphics)
 
 target_link_libraries(camcpp
         ${log-lib}
         ${android-lib}
         ${dl-lib}
+        ${jnigraphics-lib}
         camera2ndk
         ${OpenCV_LIBS}
 )

@@ -43,15 +43,68 @@ namespace backcam {
 
     static std::string gLastError;
 
-    static constexpr int kMinFps = 60;
-    static constexpr int kPreviewW = 1280;
-    static constexpr int kPreviewH = 800;
+    static constexpr int kMinFps = 240;
+    static constexpr int kPreviewW = 1920;
+    static constexpr int kPreviewH = 1080;
 
     static void setLastErrorLocked(const std::string &msg) { gLastError = msg; }
 
     static void clearLastErrorLocked() { gLastError.clear(); }
 
     static void closeAllLocked();
+
+    static bool chooseBestPreviewSize16by9(const char *camId, int32_t *outW, int32_t *outH) {
+        if (!gMgr || !camId || !outW || !outH) return false;
+
+        // SurfaceTexture/ANativeWindow output for camera preview is typically ImageFormat.PRIVATE (34)
+        static constexpr int32_t kFmtPrivate = 120;
+
+        // “yüksek ama optimum” default hedef: 1920x1080 (60 fps için genelde daha güvenli)
+        static constexpr int32_t kTargetW = 1920;
+        static constexpr int32_t kTargetH = 1080;
+
+        ACameraMetadata *chars = nullptr;
+        if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) != ACAMERA_OK ||
+            !chars)
+            return false;
+
+        ACameraMetadata_const_entry e{};
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+                                          &e) != ACAMERA_OK ||
+            e.count < 4) {
+            ACameraMetadata_free(chars);
+            return false;
+        }
+
+        bool foundTarget = false;
+        int32_t bestW = 0, bestH = 0;
+
+        // 1) Direkt 1920x1080 varsa onu seç
+        for (uint32_t i = 0; i + 3 < e.count; i += 4) {
+            const int32_t fmt = e.data.i32[i + 0];
+            const int32_t w = e.data.i32[i + 1];
+            const int32_t h = e.data.i32[i + 2];
+            const int32_t in = e.data.i32[i + 3];
+            if (in != 0) continue;
+            if (fmt != kFmtPrivate) continue;
+            if (w == kTargetW && h == kTargetH) {
+                bestW = w;
+                bestH = h;
+                foundTarget = true;
+                break;
+            }
+        }
+
+        ACameraMetadata_free(chars);
+
+        if (bestW > 0 && bestH > 0) {
+            *outW = bestW;
+            *outH = bestH;
+            return true;
+        }
+        return false;
+    }
+
 
     static bool isBackFacing(const char *cameraId) {
         if (!gMgr) return false;
@@ -93,6 +146,49 @@ namespace backcam {
         ACameraIdList *list = nullptr;
         if (ACameraManager_getCameraIdList(gMgr, &list) != ACAMERA_OK || !list) return "";
 
+        auto parseNullSeparatedIds = [](const uint8_t *data,
+                                        uint32_t count) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            if (!data || count == 0) return out;
+
+            std::string cur;
+            cur.reserve(8);
+            for (uint32_t i = 0; i < count; i++) {
+                char c = static_cast<char>(data[i]);
+                if (c == '\0') {
+                    if (!cur.empty()) {
+                        out.push_back(cur);
+                        cur.clear();
+                    }
+                } else {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) out.push_back(cur);
+            return out;
+        };
+
+        auto getPhysicalIds = [&](const char *logicalId) -> std::vector<std::string> {
+            std::vector<std::string> ids;
+#if defined(ACAMERA_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS)
+            ACameraMetadata* chars = nullptr;
+        if (ACameraManager_getCameraCharacteristics(gMgr, logicalId, &chars) != ACAMERA_OK || !chars) {
+            return ids;
+        }
+
+        ACameraMetadata_const_entry e{};
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS, &e) == ACAMERA_OK &&
+            e.count > 0) {
+            ids = parseNullSeparatedIds(reinterpret_cast<const uint8_t*>(e.data.u8), e.count);
+        }
+
+        ACameraMetadata_free(chars);
+#else
+            (void) logicalId;
+#endif
+            return ids;
+        };
+
         std::string bestId;
         float bestF = 1e9f;
 
@@ -100,10 +196,24 @@ namespace backcam {
             const char *id = list->cameraIds[i];
             if (!isBackFacing(id)) continue;
 
-            float f = getMinFocalLength(id);
-            if (f < bestF) {
-                bestF = f;
-                bestId = id;
+            // Candidate: this id
+            float candF = getMinFocalLength(id);
+            std::string candId = id;
+
+            // If this is a logical multi-cam, check its physical IDs and pick the smallest focal length among them.
+            const auto phys = getPhysicalIds(id);
+            for (const auto &pid: phys) {
+                if (!isBackFacing(pid.c_str())) continue;
+                float pf = getMinFocalLength(pid.c_str());
+                if (pf < candF) {
+                    candF = pf;
+                    candId = pid; // prefer physical ultra-wide if it is widest
+                }
+            }
+
+            if (candF < bestF) {
+                bestF = candF;
+                bestId = candId;
             }
         }
 
@@ -125,6 +235,29 @@ namespace backcam {
         }
         dlclose(h);
     }
+
+#if defined(ACAMERA_CONTROL_ZOOM_RATIO) && defined(ACAMERA_CONTROL_ZOOM_RATIO_RANGE)
+    static void applyZoomRatioLocked(const char* camId, float wantZoom) {
+    if (!gMgr || !gPreviewRequest || !camId) return;
+
+    ACameraMetadata* chars = nullptr;
+    if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) != ACAMERA_OK || !chars) return;
+
+    ACameraMetadata_const_entry e{};
+    if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_ZOOM_RATIO_RANGE, &e) == ACAMERA_OK && e.count >= 2) {
+        const float minZ = e.data.f[0];
+        const float maxZ = e.data.f[1];
+        const float z = std::min(std::max(wantZoom, minZ), maxZ);
+
+        (void)ACaptureRequest_setEntry_f(gPreviewRequest, ACAMERA_CONTROL_ZOOM_RATIO, 0.50, &z);
+        ALOGI("BackCam zoomRatio applied=%.2f (range %.2f..%.2f)", z, minZ, maxZ);
+    } else {
+        ALOGI("BackCam zoomRatio range not available");
+    }
+
+    ACameraMetadata_free(chars);
+}
+#endif
 
     static void onDeviceDisconnected(void *, ACameraDevice *) {
         std::lock_guard<std::mutex> lk(gLock);
@@ -299,7 +432,7 @@ namespace backcam {
 
         const int want = std::max(kMinFps, desiredFps);
 
-        int chosenMin = 0, chosenMax = 0;
+        int chosenMin = 120, chosenMax = 240;
 
         // 1) Exact fixed range (60-60)
         for (auto &r: ranges) {
@@ -370,6 +503,33 @@ namespace backcam {
 
     static void applyStabilityAndFovSettingsLocked(const char *camId) {
         if (!gMgr || !gPreviewRequest) return;
+
+#if defined(ACAMERA_DISTORTION_CORRECTION_MODE) && defined(ACAMERA_DISTORTION_CORRECTION_MODE_OFF) && \
+    defined(ACAMERA_DISTORTION_CORRECTION_AVAILABLE_MODES)
+        // Distortion correction OFF => en geniş FOV (balıkgözü + kenar bozulması olabilir)
+        {
+            ACameraMetadata* chars = nullptr;
+            if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) == ACAMERA_OK && chars) {
+                ACameraMetadata_const_entry dm{};
+                bool supportsOff = false;
+                if (ACameraMetadata_getConstEntry(chars, ACAMERA_DISTORTION_CORRECTION_AVAILABLE_MODES, &dm) == ACAMERA_OK &&
+                    dm.count > 0) {
+                    for (uint32_t i = 0; i < dm.count; i++) {
+                        if (dm.data.u8[i] == ACAMERA_DISTORTION_CORRECTION_MODE_OFF) {
+                            supportsOff = true;
+                            break;
+                        }
+                    }
+                }
+                ACameraMetadata_free(chars);
+
+                if (supportsOff) {
+                    uint8_t off = ACAMERA_DISTORTION_CORRECTION_MODE_OFF;
+                    (void)ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_DISTORTION_CORRECTION_MODE, 1, &off);
+                }
+            }
+        }
+#endif
 
         // Anti-banding 50Hz
         {
@@ -443,15 +603,19 @@ namespace backcam {
             return false;
         }
 
-        // 16:9 sabitle
-        (void) ANativeWindow_setBuffersGeometry(gWindow, kPreviewW, kPreviewH, 0);
-
         std::string camId = pickWidestBackCameraId();
         if (camId.empty()) {
             setLastErrorLocked("no back camera found");
             closeAllLocked();
             return false;
         }
+
+        // Şimdilik Kotlin BACK_BUF_W/H ile birebir aynı tutuyoruz (stretch/ratio sorunu sıfırlansın)
+        const int32_t prevW = kPreviewW;   // 1920
+        const int32_t prevH = kPreviewH;   // 1080
+
+        (void) ANativeWindow_setBuffersGeometry(gWindow, prevW, prevH, 0);
+        ALOGI("BackCam preview geometry fixed to %dx%d", prevW, prevH);
 
         camera_status_t st = ACameraManager_openCamera(gMgr, camId.c_str(), &gDevCbs, &gDevice);
         if (st != ACAMERA_OK || !gDevice) {
@@ -479,8 +643,7 @@ namespace backcam {
         }
 
         // TEMPLATE_RECORD -> yüksek fps stabil
-        if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_RECORD, &gPreviewRequest) !=
-            ACAMERA_OK) {
+        if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_PREVIEW, &gPreviewRequest) != ACAMERA_OK) {
             setLastErrorLocked("createCaptureRequest failed");
             closeAllLocked();
             return false;
@@ -509,6 +672,11 @@ namespace backcam {
 
         // Stabilite/FOV ayarları
         applyStabilityAndFovSettingsLocked(camId.c_str());
+
+#if defined(ACAMERA_CONTROL_ZOOM_RATIO) && defined(ACAMERA_CONTROL_ZOOM_RATIO_RANGE)
+        // Ultra-wide fiziksel ID seçildiyse: 1.0 = sensörün doğal geniş açısı (ek dijital zoom yok)
+        applyZoomRatioLocked(camId.c_str(), 0.3f);
+#endif
 
         // SurfaceFlinger için frame-rate hint
         trySetFrameRate(gWindow, (float) chosen,
