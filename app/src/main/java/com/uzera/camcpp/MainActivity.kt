@@ -64,10 +64,10 @@ class MainActivity : AppCompatActivity() {
         private const val FIXED_DIAMETER_PX = 800
 
         // for back cam view height (top 70% of diameter)
-        private const val FIXED_BACK_H = 500
+        private const val FIXED_BACK_H = 600
 
         // for external camera view height (bottom 30% of diameter)
-        private const val FIXED_EXT_H = 500
+        private const val FIXED_EXT_H = 400
 
         // for circle X position (Left Eye Center @ 25% of 3120 = 780px. 780 - 500 radius = 280)
         private const val FIXED_POS_X = 250
@@ -83,7 +83,7 @@ class MainActivity : AppCompatActivity() {
         private const val BACK_WIDTH_SCALE = 2.5f
 
         // for modifying ONLY width (X-axis) of ext camera (1.0 = normal, 1.2 = wider)
-        private const val EXT_WIDTH_SCALE = 3.3f
+        private const val EXT_WIDTH_SCALE = 3.1f
 
         init {
             System.loadLibrary("camcpp")

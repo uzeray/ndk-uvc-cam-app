@@ -67,6 +67,11 @@
 #define UVC_AE_MIN_EXPOSURE_US_CAP 400
 #endif
 
+//
+// CROP FACTOR: We only want the TOP 30% of the UVC frame.
+// This prevents squeezing 720 lines into a small view.
+#define UVC_CROP_HEIGHT_RATIO 0.30f
+
 namespace uvc {
 
     static std::mutex gLock;
@@ -748,8 +753,6 @@ namespace uvc {
 
                 // hedef fps'e yeterince yakınsa ve zaten en yüksek çözünürlüklere gidiyorsak erken çık
                 if (bestGotFps >= want - 2 && c.scoreMeet == 1) {
-                    // Daha yüksek çözünürlük adayı varsa cands zaten sıralı; burada erken çıkmak mantıklı
-                    // çünkü ilk "meet+max-res" adayını yakaladık.
                     break;
                 }
             }
@@ -767,9 +770,17 @@ namespace uvc {
 
         gW = (int) fmt.fmt.pix.width;
         gH = (int) fmt.fmt.pix.height;
-        gChosenW.store(gW, std::memory_order_relaxed);
-        gChosenH.store(gH, std::memory_order_relaxed);
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
+
+        // =========================================================================
+        // [MODIFICATION START]: Force buffer geometry to CROPPED height
+        // =========================================================================
+        // We only want the top 30% of the image.
+        // We trick Kotlin into thinking the resolution is small (e.g. 1280x216),
+        // so it creates a matching surface buffer.
+        int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
+        gChosenW.store(gW, std::memory_order_relaxed);
+        gChosenH.store(cropH, std::memory_order_relaxed); // Notify Kotlin of the smaller height
 
         // reqbufs + mmap
         v4l2_requestbuffers req{};
@@ -814,7 +825,9 @@ namespace uvc {
         }
 
         if (gWin) {
-            (void) ANativeWindow_setBuffersGeometry(gWin, gW, gH, WINDOW_FORMAT_RGBA_8888);
+            // [MODIFICATION START]: Use cropH instead of gH for the window geometry
+            (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH, WINDOW_FORMAT_RGBA_8888);
+            // [MODIFICATION END]
             int fps = gChosenFps.load(std::memory_order_relaxed);
             trySetFrameRate(gWin, (float) (fps > 0 ? fps : want));
         }
@@ -913,6 +926,11 @@ namespace uvc {
 
             uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
 
+            // [MODIFICATION START]: Calculate CROP height based on the ratio
+            int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
+            if (cropH <= 0) cropH = 1;
+            // [MODIFICATION END]
+
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -927,7 +945,11 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        renderRgbaToWindow(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        // [MODIFICATION START]: Crop top 30% and render
+                        cv::Rect roi(0, 0, gW, cropH);
+                        cv::Mat cropped = rgbaReuse(roi);
+                        renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
+                        // [MODIFICATION END]
                     }
                 }
                 continue;
@@ -947,7 +969,14 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        renderRgbaToWindow(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        // [MODIFICATION START]: Crop top 30% and render
+                        cv::Rect roi(0, 0, bgr.cols, cropH);
+                        // Ensure roi is within bounds (in case decoding gave different size)
+                        if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
+
+                        cv::Mat cropped = rgbaReuse(roi);
+                        renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
+                        // [MODIFICATION END]
                     }
                 } catch (...) {
                     // ignore decode errors
