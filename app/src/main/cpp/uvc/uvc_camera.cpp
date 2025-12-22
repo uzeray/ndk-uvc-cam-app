@@ -926,11 +926,14 @@ namespace uvc {
 
             uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
 
-            // [MODIFICATION START]: Calculate CROP height based on the ratio
+            // [MODIFICATION START]: Calculate CROP height based on the ratio (0.35f)
             int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
             if (cropH <= 0) cropH = 1;
             // [MODIFICATION END]
 
+            // ----------------------------------------------------------------------
+            // YUYV FORMAT PROCESSING
+            // ----------------------------------------------------------------------
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -945,16 +948,46 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // [MODIFICATION START]: Crop top 30% and render
+                        // 1. CROP (KIRPMA)
                         cv::Rect roi(0, 0, gW, cropH);
+                        // Güvenlik kontrolü
+                        if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
+                        if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
+
                         cv::Mat cropped = rgbaReuse(roi);
+
+                        // 2. SHARPENING (KESKİNLEŞTİRME) - BİRLEŞME NOKTASI İÇİN
+                        // Sadece en üst 20 pikseli işle (performans için tümünü işleme)
+                        int seamHeight = 20;
+                        if (seamHeight > cropped.rows) seamHeight = cropped.rows;
+
+                        cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
+                        cv::Mat topStrip = cropped(topEdgeRoi);
+
+                        // Sharpening Kernel (High-pass filter)
+                        /*
+                            0  -1   0
+                           -1   5  -1
+                            0  -1   0
+                        */
+                        cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
+                                                                0, -1, 0,
+                                -1, 5, -1,
+                                0, -1, 0);
+
+                        // Filtreyi uygula
+                        cv::filter2D(topStrip, topStrip, -1, kernel);
+
+                        // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
-                        // [MODIFICATION END]
                     }
                 }
                 continue;
             }
 
+            // ----------------------------------------------------------------------
+            // MJPEG FORMAT PROCESSING
+            // ----------------------------------------------------------------------
             if (f == V4L2_PIX_FMT_MJPEG) {
                 try {
                     cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
@@ -969,14 +1002,33 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // [MODIFICATION START]: Crop top 30% and render
+                        // 1. CROP (KIRPMA)
+                        // MJPEG decode sonrası width değişebilir diye bgr.cols kullanıyoruz
                         cv::Rect roi(0, 0, bgr.cols, cropH);
-                        // Ensure roi is within bounds (in case decoding gave different size)
+                        // Güvenlik kontrolü
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
+                        if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
 
                         cv::Mat cropped = rgbaReuse(roi);
+
+                        // 2. SHARPENING (KESKİNLEŞTİRME) - BİRLEŞME NOKTASI İÇİN
+                        int seamHeight = 20;
+                        if (seamHeight > cropped.rows) seamHeight = cropped.rows;
+
+                        cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
+                        cv::Mat topStrip = cropped(topEdgeRoi);
+
+                        // Sharpening Kernel
+                        cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
+                                                                0, -1, 0,
+                                -1, 5, -1,
+                                0, -1, 0);
+
+                        // Filtreyi uygula
+                        cv::filter2D(topStrip, topStrip, -1, kernel);
+
+                        // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
-                        // [MODIFICATION END]
                     }
                 } catch (...) {
                     // ignore decode errors
