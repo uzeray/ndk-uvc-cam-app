@@ -43,9 +43,6 @@ namespace backcam {
 
     static std::string gLastError;
 
-    // [OPTIMIZATION 1]: FPS hedefini 30'a çektik.
-    // 240 veya 60, telefonu ısıtır ve ışığı azaltır.
-    // 30 FPS = Daha az ısı, Daha az gecikme, Daha çok ışık/renk.
     static constexpr int kMinFps = 30;
     static constexpr int kPreviewW = 1920;
     static constexpr int kPreviewH = 1080;
@@ -58,7 +55,7 @@ namespace backcam {
 
     static bool chooseBestPreviewSize16by9(const char *camId, int32_t *outW, int32_t *outH) {
         if (!gMgr || !camId || !outW || !outH) return false;
-        static constexpr int32_t kFmtPrivate = 120; // IMAGE_FORMAT_PRIVATE
+        static constexpr int32_t kFmtPrivate = 120;
         static constexpr int32_t kTargetW = 1920;
         static constexpr int32_t kTargetH = 1080;
 
@@ -322,8 +319,6 @@ namespace backcam {
         return st == ACAMERA_OK;
     }
 
-    // [OPTIMIZATION 2]: FPS Seçimi sadeleştirildi ve düşürüldü.
-    // Artık 30 FPS hedefleniyor. Bu, sensörün daha uzun pozlama yapmasını sağlar (daha parlak görüntü).
     static void chooseAndApplyFpsRangeLocked(const char *camId, int desiredFps) {
         gChosenFps.store(0, std::memory_order_relaxed);
         ACameraMetadata *chars = nullptr;
@@ -339,12 +334,10 @@ namespace backcam {
         ACameraMetadata_free(chars);
         if (ranges.empty()) return;
 
-        // Isı ve ışık için 30 FPS idealdir.
         int target = 30;
         int chosenMin = 30, chosenMax = 30;
         bool found = false;
 
-        // 1. Tercih: Sabit 30 FPS [30, 30]
         for (auto &r : ranges) {
             if (r.first == 30 && r.second == 30) {
                 chosenMin = 30; chosenMax = 30;
@@ -352,7 +345,6 @@ namespace backcam {
                 break;
             }
         }
-        // 2. Tercih: Değişken [30, 60] veya benzeri
         if (!found) {
             for (auto &r : ranges) {
                 if (r.first <= 30 && r.second >= 30) {
@@ -370,20 +362,15 @@ namespace backcam {
         }
     }
 
-    // [OPTIMIZATION 3]: Görüntü Kalitesi ve Parlaklık Ayarları
     static void applyStabilityAndFovSettingsLocked(const char *camId) {
         if (!gMgr || !gPreviewRequest) return;
 
-        // [BRIGHTNESS]: Pozlama Telafisi (Exposure Compensation)
-        // Görüntüyü %20-30 daha parlak yapmak için EV değerini artırıyoruz.
-        // Genelde her adım 1/3 veya 1/2 EV'dir. +4 veya +6 vererek parlaklığı artırıyoruz.
         ACameraMetadata* chars = nullptr;
         if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) == ACAMERA_OK && chars) {
             ACameraMetadata_const_entry e{};
             if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &e) == ACAMERA_OK && e.count == 2) {
                 int32_t minEv = e.data.i32[0];
                 int32_t maxEv = e.data.i32[1];
-                // Parlaklığı artırmak için +4 (cihaza göre değişir ama güvenlidir)
                 int32_t targetEv = 2;
                 targetEv = std::max(minEv, std::min(targetEv, maxEv));
                 ACaptureRequest_setEntry_i32(gPreviewRequest, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &targetEv);
@@ -391,24 +378,11 @@ namespace backcam {
             ACameraMetadata_free(chars);
         }
 
-        // [QUALITY]: Renk ve Gürültü azaltma için "FAST" modlarını kaldırdık.
-        // Varsayılan (High Quality) modlara bırakıyoruz ki renkler daha canlı olsun.
-
-        /* ESKİ KOD (Performans için kaliteyi düşürüyordu):
-           uint8_t nr = ACAMERA_NOISE_REDUCTION_MODE_FAST;
-           uint8_t ed = ACAMERA_EDGE_MODE_FAST;
-           uint8_t ca = ACAMERA_COLOR_CORRECTION_ABERRATION_MODE_FAST;
-
-           YENİ DURUM: Bunları set etmiyoruz, otomatikte en iyisini seçsin.
-        */
-
-        // Anti-banding (Titreşim önleme)
         {
             uint8_t ab = ACAMERA_CONTROL_AE_ANTIBANDING_MODE_50HZ;
             (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AE_ANTIBANDING_MODE, 1, &ab);
         }
 
-        // Stabilizasyon KAPALI (Geniş açı için)
         {
             uint8_t vs = ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE_OFF;
             (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE, 1, &vs);
@@ -418,7 +392,6 @@ namespace backcam {
             (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_LENS_OPTICAL_STABILIZATION_MODE, 1, &os);
         }
 
-        // Crop region'ı aktif array'e set ederek dijital crop/zoom ihtimalini minimize et
         ACameraMetadata *chars2 = nullptr;
         if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars2) == ACAMERA_OK && chars2) {
             ACameraMetadata_const_entry e{};
@@ -435,9 +408,7 @@ namespace backcam {
         clearLastErrorLocked();
         closeAllLocked();
 
-        // [HEAT CONTROL]: İstenen FPS ne olursa olsun, biz 30'a limitliyoruz.
-        // Bu, termal darboğazı engeller.
-        const int wantFps = 30;
+        const int wantFps = 60;
 
         gMgr = ACameraManager_create();
         if (!gMgr) {
@@ -490,7 +461,6 @@ namespace backcam {
             return false;
         }
 
-        // [IMPORTANT]: TEMPLATE_PREVIEW gives widest FOV and standard processing
         if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_PREVIEW, &gPreviewRequest) != ACAMERA_OK) {
             setLastErrorLocked("createCaptureRequest failed");
             closeAllLocked();
@@ -509,17 +479,14 @@ namespace backcam {
             return false;
         }
 
-        // Apply Optimized FPS (30)
         chooseAndApplyFpsRangeLocked(camId.c_str(), wantFps);
 
-        // Apply Quality & Brightness Settings
         applyStabilityAndFovSettingsLocked(camId.c_str());
 
 #if defined(ACAMERA_CONTROL_ZOOM_RATIO) && defined(ACAMERA_CONTROL_ZOOM_RATIO_RANGE)
         applyZoomRatioLocked(camId.c_str(), 0.3f);
 #endif
 
-        // SurfaceFlinger hint
         trySetFrameRate(gWindow, (float) 30, (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
 
         uint8_t af = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO;

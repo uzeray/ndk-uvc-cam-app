@@ -50,7 +50,6 @@
 #define V4L2_CID_POWER_LINE_FREQUENCY_50HZ 1
 #endif
 
-// ---------- AE tuning ----------
 #ifndef UVC_AE_TARGET_LUMA
 #define UVC_AE_TARGET_LUMA 122
 #endif
@@ -67,9 +66,6 @@
 #define UVC_AE_MIN_EXPOSURE_US_CAP 400
 #endif
 
-//
-// CROP FACTOR: We only want the TOP 30% of the UVC frame.
-// This prevents squeezing 720 lines into a small view.
 #define UVC_CROP_HEIGHT_RATIO 0.30f
 
 namespace uvc {
@@ -101,13 +97,11 @@ namespace uvc {
 
     static int gW = 0, gH = 0;
 
-    // mailbox (single-latest)
     static std::mutex gFrameLock;
     static std::condition_variable gFrameCv;
     static std::vector<uint8_t> gFrameBytes;
     static std::atomic<bool> gFrameReady{false};
 
-    // AE state
     struct CtrlRange {
         bool ok = false;
         int minV = 0, maxV = 0, step = 1, defV = 0;
@@ -115,12 +109,11 @@ namespace uvc {
     static std::mutex gCtrlLock;
     static CtrlRange gExpAbs{};
     static CtrlRange gGain{};
-    static std::atomic<int> gCurExpAbs{0}; // exposure_absolute (100us)
+    static std::atomic<int> gCurExpAbs{0};
     static std::atomic<int> gCurGain{0};
     static std::atomic<bool> gAeEnabled{false};
     static std::atomic<long long> gLastAeAdjustNs{0};
 
-    // ---------- helpers ----------
     static void setErrLocked(const std::string &s) { gLastError = s; }
 
     static void clearErrLocked() { gLastError.clear(); }
@@ -436,7 +429,6 @@ namespace uvc {
     }
 
     static void applyControls(int fd, int chosenFps) {
-        // 50Hz flicker (EU/TR)
         {
             v4l2_queryctrl qc{};
             if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
@@ -445,7 +437,6 @@ namespace uvc {
             }
         }
 
-        // AE priority off (fps sabit kalsın)
         {
             v4l2_queryctrl qc{};
             if (queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, qc)) {
@@ -453,13 +444,10 @@ namespace uvc {
             }
         }
 
-        // Auto WB on
         (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
 
-        // MJPEG quality max
         trySetJpegQualityMax(fd);
 
-        // Manual exp + autogain off (varsa) + yazılımsal AE
         {
             v4l2_queryctrl qc{};
             bool expAutoOk = queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc);
@@ -500,7 +488,6 @@ namespace uvc {
         }
     }
 
-    // ---- Enumerate supported sizes/fps to choose best stable mode ----
     static std::vector<std::pair<int, int>> enumFrameSizes(int fd, uint32_t pixfmt) {
         std::vector<std::pair<int, int>> out;
 
@@ -517,10 +504,8 @@ namespace uvc {
                 int minH = (int) fse.stepwise.min_height;
                 int maxH = (int) fse.stepwise.max_height;
 
-                // En büyük
                 out.emplace_back(maxW, maxH);
 
-                // Yaygın 16:9 seçeneklerini aralığa uyarsa ekle
                 const std::pair<int, int> common[] = {
                         {3840, 2160},
                         {2560, 1440},
@@ -541,7 +526,6 @@ namespace uvc {
             }
         }
 
-        // uniq
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
         return out;
@@ -581,7 +565,7 @@ namespace uvc {
         int h = 0;
         uint32_t f = 0;
         int maxFps = 0;
-        int scoreMeet = 0; // 1 if can meet desired
+        int scoreMeet = 0;
     };
 
     static std::vector<ModeCand> buildCandidates(int fd, int desiredFps) {
@@ -591,7 +575,6 @@ namespace uvc {
         for (uint32_t f: fmts) {
             auto sizes = enumFrameSizes(fd, f);
 
-            // Eğer ENUM başarısızsa fallback liste:
             if (sizes.empty()) {
                 const std::pair<int, int> fallback[] = {
                         {1920, 1080},
@@ -611,7 +594,6 @@ namespace uvc {
                 if (w <= 0 || h <= 0) continue;
 
                 int m = enumMaxFpsFor(fd, f, w, h);
-                // ENUM interval yoksa 0 gelir; yine de denenecek ama düşük öncelik.
                 ModeCand c{};
                 c.w = w;
                 c.h = h;
@@ -622,7 +604,6 @@ namespace uvc {
             }
         }
 
-        // uniq by (f,w,h)
         std::sort(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
             if (a.f != b.f) return a.f < b.f;
             if (a.w != b.w) return a.w < b.w;
@@ -632,20 +613,15 @@ namespace uvc {
             return a.f == b.f && a.w == b.w && a.h == b.h;
         }), out.end());
 
-        // sort best-first:
         std::sort(out.begin(), out.end(), [desiredFps](const ModeCand &a, const ModeCand &b) {
-            // 1) meets desired fps (by enum) first
             if (a.scoreMeet != b.scoreMeet) return a.scoreMeet > b.scoreMeet;
 
-            // 2) prefer higher resolution area
             long long aa = (long long) a.w * (long long) a.h;
             long long bb = (long long) b.w * (long long) b.h;
             if (aa != bb) return aa > bb;
 
-            // 3) prefer higher maxFps (if known)
             if (a.maxFps != b.maxFps) return a.maxFps > b.maxFps;
 
-            // 4) prefer MJPEG over YUYV for stability/bandwidth
             if (a.f != b.f) return (a.f == V4L2_PIX_FMT_MJPEG);
 
             return false;
@@ -722,21 +698,17 @@ namespace uvc {
         int bestW = 0, bestH = 0;
         uint32_t bestFourcc = 0;
 
-        // Deneme sırası: en iyi adaydan en kötüye
         for (const auto &c: cands) {
             if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
 
-            // fps ayarla
             int tryFps = want;
             if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
             trySetFps(gFd, tryFps);
             trySetJpegQualityMax(gFd);
             int got = readFps(gFd, tryFps);
 
-            // kontrol uygula (fps sabit + kalite)
             applyControls(gFd, got);
 
-            // en iyiyi sakla
             if (!ok || (got >= want - 2 && bestGotFps < want - 2) ||
                 ((got >= want - 2) == (bestGotFps >= want - 2) &&
                  ((long long) fmt.fmt.pix.width * (long long) fmt.fmt.pix.height >
@@ -751,7 +723,6 @@ namespace uvc {
                 bestH = (int) fmt.fmt.pix.height;
                 bestFourcc = fmt.fmt.pix.pixelformat;
 
-                // hedef fps'e yeterince yakınsa ve zaten en yüksek çözünürlüklere gidiyorsak erken çık
                 if (bestGotFps >= want - 2 && c.scoreMeet == 1) {
                     break;
                 }
@@ -763,7 +734,6 @@ namespace uvc {
             return false;
         }
 
-        // Seçilen en iyi fmt'i tekrar setleyelim (bazı driverlar arada değişebiliyor)
         (void) trySetFormat(gFd, bestW, bestH, bestFourcc, fmt);
 
         gChosenFps.store(bestGotFps > 0 ? bestGotFps : want, std::memory_order_relaxed);
@@ -772,17 +742,10 @@ namespace uvc {
         gH = (int) fmt.fmt.pix.height;
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
 
-        // =========================================================================
-        // [MODIFICATION START]: Force buffer geometry to CROPPED height
-        // =========================================================================
-        // We only want the top 30% of the image.
-        // We trick Kotlin into thinking the resolution is small (e.g. 1280x216),
-        // so it creates a matching surface buffer.
         int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
         gChosenW.store(gW, std::memory_order_relaxed);
-        gChosenH.store(cropH, std::memory_order_relaxed); // Notify Kotlin of the smaller height
+        gChosenH.store(cropH, std::memory_order_relaxed);
 
-        // reqbufs + mmap
         v4l2_requestbuffers req{};
         req.count = 12;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -825,14 +788,11 @@ namespace uvc {
         }
 
         if (gWin) {
-            // [MODIFICATION START]: Use cropH instead of gH for the window geometry
             (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH, WINDOW_FORMAT_RGBA_8888);
-            // [MODIFICATION END]
             int fps = gChosenFps.load(std::memory_order_relaxed);
             trySetFrameRate(gWin, (float) (fps > 0 ? fps : want));
         }
 
-        // reserve mailbox
         {
             std::lock_guard<std::mutex> lk(gFrameLock);
             size_t cap = 512 * 1024;
@@ -840,8 +800,7 @@ namespace uvc {
                 gH > 0) {
                 cap = (size_t) gW * (size_t) gH * 2;
             } else if (gW > 0 && gH > 0) {
-                // MJPEG için de kaba bir üst sınır
-                cap = (size_t) gW * (size_t) gH; // sıkışık veri genelde bundan küçük olur
+                cap = (size_t) gW * (size_t) gH;
             }
             gFrameBytes.clear();
             gFrameBytes.reserve(cap);
@@ -851,7 +810,6 @@ namespace uvc {
         return true;
     }
 
-    // ---------- threads ----------
     static void capLoop() {
         while (gRunning.load(std::memory_order_relaxed)) {
             pollfd pfd{};
@@ -879,7 +837,6 @@ namespace uvc {
                 const uint8_t *src = (const uint8_t *) gBufs[b.index].ptr;
                 int used = (int) b.bytesused;
 
-                // hızlı AE ölçümü (YUYV için decode beklemeden)
                 if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
                     gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -906,7 +863,6 @@ namespace uvc {
     static void decLoop() {
         std::vector<uint8_t> local;
 
-        // Reuse mats where possible to reduce allocations
         cv::Mat rgbaReuse;
 
         while (gRunning.load(std::memory_order_relaxed)) {
@@ -926,13 +882,9 @@ namespace uvc {
 
             uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
 
-            // CROP Height (%35)
             int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
             if (cropH <= 0) cropH = 1;
 
-            // ----------------------------------------------------------------------
-            // YUYV FORMAT PROCESSING
-            // ----------------------------------------------------------------------
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -947,36 +899,28 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // 1. CROP
                         cv::Rect roi(0, 0, gW, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
 
-                        // 2. [DEĞİŞİKLİK BURADA] BLURRING (YUMUŞATMA) - BİRLEŞME NOKTASI İÇİN
-                        // Sadece en üst 30 pikseli bulanıklaştırıyoruz.
-                        // (Back kamera ile birleştiği yerdeki keskin çizgiyi yok etmek için)
-                        int seamHeight = 30;
-                        if (seamHeight > cropped.rows) seamHeight = cropped.rows;
+                        int fadeHeight = 50;
+                        if (fadeHeight > cropped.rows) fadeHeight = cropped.rows;
 
-                        cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
-                        cv::Mat topStrip = cropped(topEdgeRoi);
+                        for (int y = 0; y < fadeHeight; y++) {
+                            uint8_t alpha = (uint8_t)((float)y / fadeHeight * 255.0f);
+                            uint8_t* rowPtr = cropped.ptr<uint8_t>(y);
+                            for (int x = 0; x < cropped.cols; x++) {
+                                rowPtr[x * 4 + 3] = alpha;
+                            }
+                        }
 
-                        // Gaussian Blur Uygula
-                        // Size(25, 25): Bulanıklık şiddeti (Tek sayı olmalı)
-                        // 0: Standart sapma (Otomatik hesaplanır)
-                        cv::GaussianBlur(topStrip, topStrip, cv::Size(25, 25), 0);
-
-                        // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
                 }
                 continue;
             }
 
-            // ----------------------------------------------------------------------
-            // MJPEG FORMAT PROCESSING
-            // ----------------------------------------------------------------------
             if (f == V4L2_PIX_FMT_MJPEG) {
                 try {
                     cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
@@ -991,33 +935,30 @@ namespace uvc {
                         int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
                         autoExposureMaybeAdjust(avg);
 
-                        // 1. CROP
                         cv::Rect roi(0, 0, bgr.cols, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
 
-                        // 2. [DEĞİŞİKLİK BURADA] BLURRING (YUMUŞATMA)
-                        int seamHeight = 30;
-                        if (seamHeight > cropped.rows) seamHeight = cropped.rows;
+                        int fadeHeight = 50;
+                        if (fadeHeight > cropped.rows) fadeHeight = cropped.rows;
 
-                        cv::Rect topEdgeRoi(0, 0, cropped.cols, seamHeight);
-                        cv::Mat topStrip = cropped(topEdgeRoi);
+                        for (int y = 0; y < fadeHeight; y++) {
+                            uint8_t alpha = (uint8_t)((float)y / fadeHeight * 255.0f);
+                            uint8_t* rowPtr = cropped.ptr<uint8_t>(y);
+                            for (int x = 0; x < cropped.cols; x++) {
+                                rowPtr[x * 4 + 3] = alpha;
+                            }
+                        }
 
-                        // Gaussian Blur Uygula
-                        cv::GaussianBlur(topStrip, topStrip, cv::Size(25, 25), 0);
-
-                        // 3. RENDER
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
                 } catch (...) {
-                    // ignore decode errors
                 }
             }
         }
     }
 
-    // ---------- public API ----------
     bool start(JNIEnv *env, jobject surface, int desiredFps) {
         std::lock_guard<std::mutex> lk(gLock);
         clearErrLocked();

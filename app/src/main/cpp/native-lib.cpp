@@ -41,7 +41,6 @@ Java_com_uzera_camcpp_MainActivity_nativeGetBackLastError(JNIEnv *env, jobject) 
     return env->NewStringUTF(s.c_str());
 }
 
-// -------- UVC --------
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_uzera_camcpp_MainActivity_nativeStartExternalPreview(JNIEnv *env, jobject, jobject surface,
@@ -95,14 +94,6 @@ Java_com_uzera_camcpp_MainActivity_nativeOpenCvSmokeTest(JNIEnv *env, jobject) {
     return env->NewStringUTF(s.c_str());
 }
 
-// ============================================================
-//  OpenCV Seam Blend
-//  backStrip: (W x overlap)
-//  extStrip : (W x overlap)
-//  outBand  : (W x 2*overlap)
-//  Gaussian blur + crossfade to naturalize boundary
-// ============================================================
-
 static inline bool
 lockBitmapRGBA(JNIEnv *env, jobject bmp, AndroidBitmapInfo &info, void **pixels) {
     if (!bmp) return false;
@@ -148,7 +139,6 @@ Java_com_uzera_camcpp_MainActivity_nativeBlendSeam(JNIEnv *env, jobject,
 
     bool ok = true;
 
-    // validate sizes
     if ((int) ei.width != W || (int) ei.height != H) ok = false;
     if ((int) oi.width != W || (int) oi.height != outH) ok = false;
     if (H != overlap) ok = false;
@@ -158,13 +148,8 @@ Java_com_uzera_camcpp_MainActivity_nativeBlendSeam(JNIEnv *env, jobject,
         cv::Mat ext(H, W, CV_8UC4, ep);
         cv::Mat out(outH, W, CV_8UC4, op);
 
-        // Build vertical crossfade band:
-        // y in [0..outH-1]
-        // - top half samples back rows [0..overlap-1]
-        // - bottom half samples ext rows [0..overlap-1]
-        // - alpha decreases smoothly from 1 to 0 across outH
         for (int y = 0; y < outH; y++) {
-            float a = 1.0f - (float) y / (float) (outH - 1); // back weight
+            float a = 1.0f - (float) y / (float) (outH - 1);
             int by = (y < overlap) ? y : (overlap - 1);
             int ey = (y < overlap) ? 0 : (y - overlap);
 
@@ -178,8 +163,6 @@ Java_com_uzera_camcpp_MainActivity_nativeBlendSeam(JNIEnv *env, jobject,
             cv::addWeighted(br, a, er, 1.0f - a, 0.0, orow);
         }
 
-        // Gaussian blur to naturalize seam (light, fast)
-        // sigmaY tuned; sigmaX kept small to avoid horizontal softness
         cv::GaussianBlur(out, out, cv::Size(0, 0), 1.6, 0.6);
     }
 
