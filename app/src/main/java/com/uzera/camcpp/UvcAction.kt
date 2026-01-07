@@ -188,7 +188,7 @@ class UvcAction(
         val srcWF = srcW.toFloat()
         val srcHF = srcH.toFloat()
 
-        var kx = 0.48f
+        var kx = 0.50f
         val ky = 1.80f
 
         val TRIM_RIGHT_PX = 15f
