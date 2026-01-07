@@ -66,7 +66,7 @@
 #define UVC_AE_MIN_EXPOSURE_US_CAP 400
 #endif
 
-#define UVC_CROP_HEIGHT_RATIO 0.30f
+#define UVC_CROP_HEIGHT_RATIO 1.00f
 
 namespace uvc {
 
@@ -115,7 +115,6 @@ namespace uvc {
     static std::atomic<long long> gLastAeAdjustNs{0};
 
     static void setErrLocked(const std::string &s) { gLastError = s; }
-
     static void clearErrLocked() { gLastError.clear(); }
 
     static int xioctl(int fd, unsigned long req, void *arg) {
@@ -507,14 +506,7 @@ namespace uvc {
                 out.emplace_back(maxW, maxH);
 
                 const std::pair<int, int> common[] = {
-                        {3840, 2160},
-                        {2560, 1440},
-                        {1920, 1080},
-                        {1600, 900},
-                        {1280, 720},
-                        {960,  540},
-                        {640,  360},
-                        {640,  480}
+                        {1280,  720}
                 };
                 for (auto &c: common) {
                     if (c.first >= minW && c.first <= maxW && c.second >= minH &&
@@ -577,13 +569,7 @@ namespace uvc {
 
             if (sizes.empty()) {
                 const std::pair<int, int> fallback[] = {
-                        {1920, 1080},
-                        {1600, 900},
-                        {1280, 720},
-                        {1024, 576},
-                        {960,  540},
-                        {800,  600},
-                        {640,  480}
+                        {1280, 720}
                 };
                 sizes.assign(std::begin(fallback), std::end(fallback));
             }
@@ -599,7 +585,7 @@ namespace uvc {
                 c.h = h;
                 c.f = f;
                 c.maxFps = m;
-                c.scoreMeet = (m >= desiredFps - 2) ? 1 : 0;
+                c.scoreMeet = (m >= desiredFps) ? 1 : 0;
                 out.push_back(c);
             }
         }
@@ -687,7 +673,6 @@ namespace uvc {
         }
 
         const int want = (desiredFps > 0 ? desiredFps : 60);
-
         auto cands = buildCandidates(gFd, want);
 
         v4l2_format fmt{};
@@ -742,7 +727,8 @@ namespace uvc {
         gH = (int) fmt.fmt.pix.height;
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
 
-        int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
+        // Crop kapalı → chosenH = gH
+        const int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
         gChosenW.store(gW, std::memory_order_relaxed);
         gChosenH.store(cropH, std::memory_order_relaxed);
 
@@ -788,6 +774,7 @@ namespace uvc {
         }
 
         if (gWin) {
+            // Crop kapalı: geometry tam H
             (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH, WINDOW_FORMAT_RGBA_8888);
             int fps = gChosenFps.load(std::memory_order_relaxed);
             trySetFrameRate(gWin, (float) (fps > 0 ? fps : want));
@@ -796,8 +783,7 @@ namespace uvc {
         {
             std::lock_guard<std::mutex> lk(gFrameLock);
             size_t cap = 512 * 1024;
-            if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
-                gH > 0) {
+            if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 && gH > 0) {
                 cap = (size_t) gW * (size_t) gH * 2;
             } else if (gW > 0 && gH > 0) {
                 cap = (size_t) gW * (size_t) gH;
@@ -837,8 +823,7 @@ namespace uvc {
                 const uint8_t *src = (const uint8_t *) gBufs[b.index].ptr;
                 int used = (int) b.bytesused;
 
-                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
-                    gH > 0) {
+                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
                     if ((size_t) used >= need) {
                         int avg = avgLumaYuyvSample(src, gW, gH);
@@ -862,7 +847,6 @@ namespace uvc {
 
     static void decLoop() {
         std::vector<uint8_t> local;
-
         cv::Mat rgbaReuse;
 
         while (gRunning.load(std::memory_order_relaxed)) {
@@ -904,17 +888,6 @@ namespace uvc {
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
 
-                        int fadeHeight = 50;
-                        if (fadeHeight > cropped.rows) fadeHeight = cropped.rows;
-
-                        for (int y = 0; y < fadeHeight; y++) {
-                            uint8_t alpha = (uint8_t)((float)y / fadeHeight * 255.0f);
-                            uint8_t* rowPtr = cropped.ptr<uint8_t>(y);
-                            for (int x = 0; x < cropped.cols; x++) {
-                                rowPtr[x * 4 + 3] = alpha;
-                            }
-                        }
-
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
                 }
@@ -926,8 +899,7 @@ namespace uvc {
                     cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
                     cv::Mat bgr = cv::imdecode(buf, cv::IMREAD_COLOR);
                     if (!bgr.empty()) {
-                        if (rgbaReuse.empty() || rgbaReuse.cols != bgr.cols ||
-                            rgbaReuse.rows != bgr.rows) {
+                        if (rgbaReuse.empty() || rgbaReuse.cols != bgr.cols || rgbaReuse.rows != bgr.rows) {
                             rgbaReuse = cv::Mat(bgr.rows, bgr.cols, CV_8UC4);
                         }
                         cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
@@ -939,17 +911,6 @@ namespace uvc {
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
-
-                        int fadeHeight = 50;
-                        if (fadeHeight > cropped.rows) fadeHeight = cropped.rows;
-
-                        for (int y = 0; y < fadeHeight; y++) {
-                            uint8_t alpha = (uint8_t)((float)y / fadeHeight * 255.0f);
-                            uint8_t* rowPtr = cropped.ptr<uint8_t>(y);
-                            for (int x = 0; x < cropped.cols; x++) {
-                                rowPtr[x * 4 + 3] = alpha;
-                            }
-                        }
 
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
@@ -1005,9 +966,7 @@ namespace uvc {
     }
 
     long long lastFrameTimestampNs() { return gLastFrameTsNs.load(std::memory_order_relaxed); }
-
     int estimatedFpsX100() { return gFpsX100.load(std::memory_order_relaxed); }
-
     int chosenFps() { return gChosenFps.load(std::memory_order_relaxed); }
 
     std::string lastError() {

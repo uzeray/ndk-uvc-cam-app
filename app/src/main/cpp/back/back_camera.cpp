@@ -41,11 +41,32 @@ namespace backcam {
     static std::atomic<int> gChosenFps{0};
     static std::atomic<bool> gRepeatingStarted{false};
 
+    static int gSensorOrientationDeg = 0;
+    static std::string gChosenCamId;
+
+    static int readSensorOrientationDeg(const char *cameraId) {
+        if (!gMgr || !cameraId) return 0;
+        ACameraMetadata *chars = nullptr;
+        if (ACameraManager_getCameraCharacteristics(gMgr, cameraId, &chars) != ACAMERA_OK ||
+            !chars) {
+            return 0;
+        }
+
+        ACameraMetadata_const_entry e{};
+        int deg = 0;
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_ORIENTATION, &e) == ACAMERA_OK &&
+            e.count > 0) {
+            deg = e.data.i32[0];
+        }
+        ACameraMetadata_free(chars);
+        return deg;
+    }
+
     static std::string gLastError;
 
-    static constexpr int kMinFps = 30;
-    static constexpr int kPreviewW = 1920;
-    static constexpr int kPreviewH = 1080;
+    static constexpr int kMinFps = 60;
+    static constexpr int kPreviewW = 1280;
+    static constexpr int kPreviewH = 720;
 
     static void setLastErrorLocked(const std::string &msg) { gLastError = msg; }
 
@@ -64,7 +85,8 @@ namespace backcam {
             return false;
 
         ACameraMetadata_const_entry e{};
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &e) != ACAMERA_OK || e.count < 4) {
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+                                          &e) != ACAMERA_OK || e.count < 4) {
             ACameraMetadata_free(chars);
             return false;
         }
@@ -104,7 +126,8 @@ namespace backcam {
             return false;
         ACameraMetadata_const_entry entry{};
         bool back = false;
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_FACING, &entry) == ACAMERA_OK && entry.count > 0) {
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_FACING, &entry) == ACAMERA_OK &&
+            entry.count > 0) {
             back = (entry.data.u8[0] == ACAMERA_LENS_FACING_BACK);
         }
         ACameraMetadata_free(chars);
@@ -117,7 +140,8 @@ namespace backcam {
             return 1e9f;
         ACameraMetadata_const_entry e{};
         float minF = 1e9f;
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &e) == ACAMERA_OK && e.count > 0) {
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &e) ==
+            ACAMERA_OK && e.count > 0) {
             for (uint32_t i = 0; i < e.count; i++) {
                 minF = std::min(minF, e.data.f[i]);
             }
@@ -131,7 +155,8 @@ namespace backcam {
         ACameraIdList *list = nullptr;
         if (ACameraManager_getCameraIdList(gMgr, &list) != ACAMERA_OK || !list) return "";
 
-        auto parseNullSeparatedIds = [](const uint8_t *data, uint32_t count) -> std::vector<std::string> {
+        auto parseNullSeparatedIds = [](const uint8_t *data,
+                                        uint32_t count) -> std::vector<std::string> {
             std::vector<std::string> out;
             if (!data || count == 0) return out;
             std::string cur;
@@ -239,7 +264,8 @@ namespace backcam {
 
     static ACameraDevice_stateCallbacks gDevCbs = {nullptr, onDeviceDisconnected, onDeviceError};
 
-    static void onCaptureStarted(void *, ACameraCaptureSession *, const ACaptureRequest *, int64_t timestamp) {
+    static void
+    onCaptureStarted(void *, ACameraCaptureSession *, const ACaptureRequest *, int64_t timestamp) {
         gLastSensorTsNs.store((long long) timestamp, std::memory_order_relaxed);
         long long prev = gPrevTsNs.exchange((long long) timestamp, std::memory_order_relaxed);
         if (prev != 0 && timestamp > prev) {
@@ -250,23 +276,27 @@ namespace backcam {
         }
     }
 
-    static void onCaptureCompleted(void *, ACameraCaptureSession *, ACaptureRequest *, const ACameraMetadata *result) {
+    static void onCaptureCompleted(void *, ACameraCaptureSession *, ACaptureRequest *,
+                                   const ACameraMetadata *result) {
         if (!result) return;
         ACameraMetadata_const_entry e{};
-        if (ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_TIMESTAMP, &e) == ACAMERA_OK && e.count > 0) {
+        if (ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_TIMESTAMP, &e) == ACAMERA_OK &&
+            e.count > 0) {
             gLastSensorTsNs.store((long long) e.data.i64[0], std::memory_order_relaxed);
         }
     }
 
     static ACameraCaptureSession_captureCallbacks gCapCbs = {
-            nullptr, onCaptureStarted, nullptr, onCaptureCompleted, nullptr, nullptr, nullptr, nullptr
+            nullptr, onCaptureStarted, nullptr, onCaptureCompleted, nullptr, nullptr, nullptr,
+            nullptr
     };
 
     static void startRepeatingLocked() {
         if (!gSession || !gPreviewRequest) return;
         if (gRepeatingStarted.exchange(true)) return;
         int seqId = 0;
-        camera_status_t st = ACameraCaptureSession_setRepeatingRequest(gSession, &gCapCbs, 1, &gPreviewRequest, &seqId);
+        camera_status_t st = ACameraCaptureSession_setRepeatingRequest(gSession, &gCapCbs, 1,
+                                                                       &gPreviewRequest, &seqId);
         if (st != ACAMERA_OK) {
             setLastErrorLocked(std::string("setRepeatingRequest failed=") + std::to_string(st));
             gRepeatingStarted.store(false);
@@ -293,18 +323,45 @@ namespace backcam {
         startRepeatingLocked();
     }
 
-    static ACameraCaptureSession_stateCallbacks gSessionCbs = {nullptr, onSessionClosed, onSessionReady, onSessionActive};
+    static ACameraCaptureSession_stateCallbacks gSessionCbs = {nullptr, onSessionClosed,
+                                                               onSessionReady, onSessionActive};
 
     static void closeAllLocked() {
-        if (gSession) { ACameraCaptureSession_close(gSession); gSession = nullptr; }
+        if (gSession) {
+            ACameraCaptureSession_close(gSession);
+            gSession = nullptr;
+        }
         gRepeatingStarted.store(false);
-        if (gPreviewRequest) { ACaptureRequest_free(gPreviewRequest); gPreviewRequest = nullptr; }
-        if (gTarget) { ACameraOutputTarget_free(gTarget); gTarget = nullptr; }
-        if (gSessionOutput) { ACaptureSessionOutput_free(gSessionOutput); gSessionOutput = nullptr; }
-        if (gOutputs) { ACaptureSessionOutputContainer_free(gOutputs); gOutputs = nullptr; }
-        if (gDevice) { ACameraDevice_close(gDevice); gDevice = nullptr; }
-        if (gWindow) { ANativeWindow_release(gWindow); gWindow = nullptr; }
-        if (gMgr) { ACameraManager_delete(gMgr); gMgr = nullptr; }
+        if (gPreviewRequest) {
+            ACaptureRequest_free(gPreviewRequest);
+            gPreviewRequest = nullptr;
+        }
+        if (gTarget) {
+            ACameraOutputTarget_free(gTarget);
+            gTarget = nullptr;
+        }
+        if (gSessionOutput) {
+            ACaptureSessionOutput_free(gSessionOutput);
+            gSessionOutput = nullptr;
+        }
+        if (gOutputs) {
+            ACaptureSessionOutputContainer_free(gOutputs);
+            gOutputs = nullptr;
+        }
+        if (gDevice) {
+            ACameraDevice_close(gDevice);
+            gDevice = nullptr;
+        }
+        if (gWindow) {
+            ANativeWindow_release(gWindow);
+            gWindow = nullptr;
+        }
+        if (gMgr) {
+            ACameraManager_delete(gMgr);
+            gMgr = nullptr;
+        }
+        gSensorOrientationDeg = 0;
+        gChosenCamId.clear();
         gLastSensorTsNs.store(0, std::memory_order_relaxed);
         gPrevTsNs.store(0, std::memory_order_relaxed);
         gFpsX100.store(0, std::memory_order_relaxed);
@@ -315,18 +372,23 @@ namespace backcam {
     static bool setFpsRangeLocked(int mn, int mx) {
         if (!gPreviewRequest) return false;
         int32_t fpsRange[2] = {mn, mx};
-        camera_status_t st = ACaptureRequest_setEntry_i32(gPreviewRequest, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fpsRange);
+        camera_status_t st = ACaptureRequest_setEntry_i32(gPreviewRequest,
+                                                          ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2,
+                                                          fpsRange);
         return st == ACAMERA_OK;
     }
 
     static void chooseAndApplyFpsRangeLocked(const char *camId, int desiredFps) {
         gChosenFps.store(0, std::memory_order_relaxed);
         ACameraMetadata *chars = nullptr;
-        if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) != ACAMERA_OK || !chars) return;
+        if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) != ACAMERA_OK ||
+            !chars)
+            return;
 
         ACameraMetadata_const_entry e{};
         std::vector<std::pair<int, int>> ranges;
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, &e) == ACAMERA_OK && e.count >= 2) {
+        if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES,
+                                          &e) == ACAMERA_OK && e.count >= 2) {
             for (uint32_t i = 0; i + 1 < e.count; i += 2) {
                 ranges.emplace_back(e.data.i32[i], e.data.i32[i + 1]);
             }
@@ -338,15 +400,16 @@ namespace backcam {
         int chosenMin = 30, chosenMax = 30;
         bool found = false;
 
-        for (auto &r : ranges) {
+        for (auto &r: ranges) {
             if (r.first == 30 && r.second == 30) {
-                chosenMin = 30; chosenMax = 30;
+                chosenMin = 30;
+                chosenMax = 30;
                 found = true;
                 break;
             }
         }
         if (!found) {
-            for (auto &r : ranges) {
+            for (auto &r: ranges) {
                 if (r.first <= 30 && r.second >= 30) {
                     chosenMin = r.first;
                     chosenMax = r.second;
@@ -365,40 +428,43 @@ namespace backcam {
     static void applyStabilityAndFovSettingsLocked(const char *camId) {
         if (!gMgr || !gPreviewRequest) return;
 
-        ACameraMetadata* chars = nullptr;
+        ACameraMetadata *chars = nullptr;
         if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars) == ACAMERA_OK && chars) {
             ACameraMetadata_const_entry e{};
-            if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &e) == ACAMERA_OK && e.count == 2) {
+            if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &e) ==
+                ACAMERA_OK && e.count == 2) {
                 int32_t minEv = e.data.i32[0];
                 int32_t maxEv = e.data.i32[1];
                 int32_t targetEv = 2;
                 targetEv = std::max(minEv, std::min(targetEv, maxEv));
-                ACaptureRequest_setEntry_i32(gPreviewRequest, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &targetEv);
+                ACaptureRequest_setEntry_i32(gPreviewRequest,
+                                             ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1,
+                                             &targetEv);
             }
             ACameraMetadata_free(chars);
         }
 
         {
             uint8_t ab = ACAMERA_CONTROL_AE_ANTIBANDING_MODE_50HZ;
-            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AE_ANTIBANDING_MODE, 1, &ab);
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AE_ANTIBANDING_MODE,
+                                               1, &ab);
         }
 
         {
             uint8_t vs = ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE_OFF;
-            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE, 1, &vs);
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest,
+                                               ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE, 1, &vs);
         }
         {
             uint8_t os = ACAMERA_LENS_OPTICAL_STABILIZATION_MODE_OFF;
-            (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_LENS_OPTICAL_STABILIZATION_MODE, 1, &os);
+            (void) ACaptureRequest_setEntry_u8(gPreviewRequest,
+                                               ACAMERA_LENS_OPTICAL_STABILIZATION_MODE, 1, &os);
         }
 
         ACameraMetadata *chars2 = nullptr;
         if (ACameraManager_getCameraCharacteristics(gMgr, camId, &chars2) == ACAMERA_OK && chars2) {
             ACameraMetadata_const_entry e{};
-            if (ACameraMetadata_getConstEntry(chars2, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &e) == ACAMERA_OK && e.count >= 4) {
-                int32_t crop[4] = {e.data.i32[0], e.data.i32[1], e.data.i32[2], e.data.i32[3]};
-                (void) ACaptureRequest_setEntry_i32(gPreviewRequest, ACAMERA_SCALER_CROP_REGION, 4, crop);
-            }
+
             ACameraMetadata_free(chars2);
         }
     }
@@ -429,6 +495,11 @@ namespace backcam {
             closeAllLocked();
             return false;
         }
+
+        gChosenCamId = camId;
+        gSensorOrientationDeg = readSensorOrientationDeg(camId.c_str());
+        ALOGI("BackCam chosenId=%s sensorOrientation=%d", gChosenCamId.c_str(),
+              gSensorOrientationDeg);
 
         const int32_t prevW = kPreviewW;
         const int32_t prevH = kPreviewH;
@@ -461,7 +532,8 @@ namespace backcam {
             return false;
         }
 
-        if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_PREVIEW, &gPreviewRequest) != ACAMERA_OK) {
+        if (ACameraDevice_createCaptureRequest(gDevice, TEMPLATE_PREVIEW, &gPreviewRequest) !=
+            ACAMERA_OK) {
             setLastErrorLocked("createCaptureRequest failed");
             closeAllLocked();
             return false;
@@ -483,11 +555,9 @@ namespace backcam {
 
         applyStabilityAndFovSettingsLocked(camId.c_str());
 
-#if defined(ACAMERA_CONTROL_ZOOM_RATIO) && defined(ACAMERA_CONTROL_ZOOM_RATIO_RANGE)
-        applyZoomRatioLocked(camId.c_str(), 0.3f);
-#endif
 
-        trySetFrameRate(gWindow, (float) 30, (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        trySetFrameRate(gWindow, (float) 30,
+                        (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
 
         uint8_t af = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
         (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AF_MODE, 1, &af);
@@ -512,6 +582,10 @@ namespace backcam {
     long long lastSensorTimestampNs() { return gLastSensorTsNs.load(std::memory_order_relaxed); }
 
     int estimatedFpsX100() { return gFpsX100.load(std::memory_order_relaxed); }
+
+    int sensorOrientationDeg() { return gSensorOrientationDeg; }
+
+    std::string chosenCameraId() { return gChosenCamId; }
 
     int chosenFps() { return gChosenFps.load(std::memory_order_relaxed); }
 

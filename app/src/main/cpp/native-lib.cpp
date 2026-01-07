@@ -10,23 +10,23 @@
 #include "uvc/uvc_camera.h"
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeStartBackPreview(JNIEnv *env, jobject, jobject surface,
+Java_com_uzera_camcpp_BackAction_nativeStartBackPreview(JNIEnv *env, jobject, jobject surface,
                                                           jint desiredFps) {
     return backcam::start(env, surface, (int) desiredFps) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeStopBackPreview(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_BackAction_nativeStopBackPreview(JNIEnv *, jobject) {
     backcam::stop();
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetBackLastSensorTimestampNs(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_BackAction_nativeGetBackLastSensorTimestampNs(JNIEnv *, jobject) {
     return (jlong) backcam::lastSensorTimestampNs();
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetBackEstimatedFpsX100(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_BackAction_nativeGetBackEstimatedFpsX100(JNIEnv *, jobject) {
     return (jint) backcam::estimatedFpsX100();
 }
 
@@ -36,30 +36,41 @@ Java_com_uzera_camcpp_MainActivity_nativeGetBackChosenFps(JNIEnv *, jobject) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetBackLastError(JNIEnv *env, jobject) {
+Java_com_uzera_camcpp_BackAction_nativeGetBackLastError(JNIEnv *env, jobject) {
     std::string s = backcam::lastError();
     return env->NewStringUTF(s.c_str());
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_uzera_camcpp_BackAction_nativeGetBackChosenSensorOrientationDeg(JNIEnv *, jobject) {
+    return (jint) backcam::sensorOrientationDeg();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_uzera_camcpp_BackAction_nativeGetBackChosenCameraId(JNIEnv *env, jobject) {
+    std::string id = backcam::chosenCameraId();
+    return env->NewStringUTF(id.c_str());
+}
+
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeStartExternalPreview(JNIEnv *env, jobject, jobject surface,
+Java_com_uzera_camcpp_UvcAction_nativeStartExternalPreview(JNIEnv *env, jobject, jobject surface,
                                                               jint desiredFps) {
     return uvc::start(env, surface, (int) desiredFps) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeStopExternalPreview(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_UvcAction_nativeStopExternalPreview(JNIEnv *, jobject) {
     uvc::stop();
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetExtLastSensorTimestampNs(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_UvcAction_nativeGetExtLastSensorTimestampNs(JNIEnv *, jobject) {
     return (jlong) uvc::lastFrameTimestampNs();
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetExtEstimatedFpsX100(JNIEnv *, jobject) {
+Java_com_uzera_camcpp_UvcAction_nativeGetExtEstimatedFpsX100(JNIEnv *, jobject) {
     return (jint) uvc::estimatedFpsX100();
 }
 
@@ -69,13 +80,13 @@ Java_com_uzera_camcpp_MainActivity_nativeGetExtChosenFps(JNIEnv *, jobject) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetExtLastError(JNIEnv *env, jobject) {
+Java_com_uzera_camcpp_UvcAction_nativeGetExtLastError(JNIEnv *env, jobject) {
     std::string s = uvc::lastError();
     return env->NewStringUTF(s.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_uzera_camcpp_MainActivity_nativeGetExtChosenMode(JNIEnv *env, jobject) {
+Java_com_uzera_camcpp_UvcAction_nativeGetExtChosenMode(JNIEnv *env, jobject) {
     std::string s = uvc::chosenMode();
     return env->NewStringUTF(s.c_str());
 }

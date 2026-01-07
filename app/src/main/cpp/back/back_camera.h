@@ -15,4 +15,7 @@ namespace backcam {
     int chosenFps();
 
     std::string lastError();
+
+    int sensorOrientationDeg();
+    std::string chosenCameraId();
 }
