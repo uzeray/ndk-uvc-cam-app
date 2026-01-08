@@ -51,10 +51,10 @@
 #endif
 
 #ifndef UVC_AE_TARGET_LUMA
-#define UVC_AE_TARGET_LUMA 80
+#define UVC_AE_TARGET_LUMA 250
 #endif
 #ifndef UVC_AE_TOL
-#define UVC_AE_TOL 3
+#define UVC_AE_TOL 6
 #endif
 #ifndef UVC_AE_ADJUST_INTERVAL_MS
 #define UVC_AE_ADJUST_INTERVAL_MS 60
@@ -1012,6 +1012,8 @@ namespace uvc {
                         }
                         cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
 
+                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        autoExposureMaybeAdjust(avg);
 
                         cv::Rect roi(0, 0, bgr.cols, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
