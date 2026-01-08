@@ -6,17 +6,14 @@
 #include <android/native_window_jni.h>
 #include <android/native_window.h>
 
-// Camera2 NDK
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraDevice.h>
 #include <camera/NdkCameraCaptureSession.h>
 #include <camera/NdkCameraMetadata.h>
 
-// Media NDK (ImageReader için)
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
 
-// OpenCV
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -31,7 +28,6 @@
 #include <cmath>
 #include <dlfcn.h>
 
-// --- UVC'den kopyalanan ayarlar (Eşit görünüm için) ---
 #define UVC_CROP_HEIGHT_RATIO 1.00f
 #ifndef BACK_SEAM_PX
 #define BACK_SEAM_PX 12
@@ -40,7 +36,6 @@
 #define BACK_EDGE_PX 24
 #endif
 
-// Processing parametreleri
 static constexpr double UVC_SEAM_SIGMA_X = 2.0;
 static constexpr double UVC_SEAM_SIGMA_Y = 0.8;
 static constexpr double UVC_SHARP_SIGMA = 1.0;
@@ -48,7 +43,6 @@ static constexpr double UVC_SHARP_AMOUNT = 0.60;
 
 namespace backcam {
 
-    // --- Global Değişkenler ve Threading ---
     static std::mutex gLock;
 
     static ACameraManager *gMgr = nullptr;
@@ -56,11 +50,9 @@ namespace backcam {
     static ACameraCaptureSession *gSession = nullptr;
     static ACaptureRequest *gPreviewRequest = nullptr;
 
-    // AImageReader
     static AImageReader *gImgReader = nullptr;
     static ANativeWindow *gImgReaderWindow = nullptr;
 
-    // Ekrana çizim yapılacak pencere (JNI'dan gelen Surface)
     static ANativeWindow *gJavaWindow = nullptr;
 
     static ACameraOutputTarget *gTarget = nullptr;
@@ -84,16 +76,12 @@ namespace backcam {
 
     static std::thread gThDec;
 
-    // ÖNEMLİ: Eğer rotate yapacaksak buffer boyutlarını değiştirmek gerekebilir.
-    // Şimdilik 1280x720 istiyoruz.
     static constexpr int kPreviewW = 1280;
     static constexpr int kPreviewH = 720;
 
     static void setLastErrorLocked(const std::string &msg) { gLastError = msg; }
 
     static void clearLastErrorLocked() { gLastError.clear(); }
-
-    // --- OpenCV Processing Helperları ---
 
     static inline void setAlphaRect(cv::Mat &rgba, const cv::Rect &r, uint8_t a) {
         if (rgba.empty()) return;
@@ -154,17 +142,13 @@ namespace backcam {
     static inline void applyBottomSeamBlur(cv::Mat &rgba) {
         if (rgba.empty()) return;
 
-        // Alt 10px'i hesapla
         int seamH = std::min((int) BACK_SEAM_PX, rgba.rows);
         if (seamH <= 0) return;
 
-        // ROI: Resmin en altındaki dikdörtgen
         cv::Rect bottomRect(0, rgba.rows - seamH, rgba.cols, seamH);
 
-        // Sadece bu bölgeyi al
         cv::Mat bottomRoi = rgba(bottomRect);
 
-        // Gaussian Blur uygula (Genişlikte sigma 2.0, Yükseklikte 2.0 yumuşak geçiş için)
         cv::GaussianBlur(bottomRoi, bottomRoi, cv::Size(0, 0), 2.0, 2.0);
     }
 
@@ -246,8 +230,8 @@ namespace backcam {
                     const uint8_t *uRow = uData + r * uStride;
                     uint8_t *dRow = uvDst + r * w;
                     for (int c = 0; c < uvW; ++c) {
-                        dRow[c * 2 + 0] = vRow[c * uvPixelStride]; // V
-                        dRow[c * 2 + 1] = uRow[c * uvPixelStride]; // U
+                        dRow[c * 2 + 0] = vRow[c * uvPixelStride];
+                        dRow[c * 2 + 1] = uRow[c * uvPixelStride];
                     }
                 }
             } else {
@@ -264,8 +248,6 @@ namespace backcam {
         gFrameCv.notify_one();
         AImage_delete(image);
     }
-
-    // --- Decode & Render Loop (Opencv İşleme) ---
 
     static void decLoop() {
         std::vector<uint8_t> localYuv;
@@ -297,24 +279,12 @@ namespace backcam {
                 rgbaReuse = cv::Mat(lh, lw, CV_8UC4);
             }
 
-            // 1. YUV -> RGBA
             cv::cvtColor(yuv, rgbaReuse, cv::COLOR_YUV2RGBA_NV21);
 
-            // 2. ROTASYON (90 Derece)
             cv::rotate(rgbaReuse, rgbaReuse, cv::ROTATE_90_CLOCKWISE);
 
-            // 3. EFEKTLER (BURASI DEĞİŞTİ)
-            // UVC fonksiyonunu çağırma (o üstü siliyor). Biz elle yapıyoruz:
-
-            // A) Keskinleştirme (Opsiyonel ama kalitenin düşmemesi için iyi)
-            // Kenarlardan 24px içerisini keskinleştir (UVC ile tutarlı olsun)
-            /* İstersen burayı açabilirsin, ama sadece blur istediğin için kapalı tutuyorum.
-               Kaliteyi artırmak istersen unsharpRect kullanabilirsin. */
-
-            // B) ALT KENAR BLUR (İstediğin 10px Gaussian)
             applyBottomSeamBlur(rgbaReuse);
 
-            // 4. Ekrana bas
             renderRgbaToWindow(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
         }
     }

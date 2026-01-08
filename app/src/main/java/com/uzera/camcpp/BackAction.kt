@@ -1,7 +1,6 @@
 package com.uzera.camcpp
 
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
@@ -81,7 +80,7 @@ class BackAction(
         stopBack()
     }
 
-    fun onConfigurationChanged(newConfig: Configuration) {
+    fun onConfigurationChanged() {
         updateBackRotationFromDisplay()
         applyBackTransform()
     }

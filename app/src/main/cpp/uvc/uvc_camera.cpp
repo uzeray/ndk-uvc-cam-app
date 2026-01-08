@@ -32,7 +32,6 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-// V4L2 Tanımları (Eksikse diye)
 #ifndef V4L2_CID_JPEG_COMPRESSION_QUALITY
 #define V4L2_CID_JPEG_COMPRESSION_QUALITY 0x009f090d
 #endif
@@ -51,7 +50,6 @@
 #define V4L2_CID_POWER_LINE_FREQUENCY_50HZ 1
 #endif
 
-// AE (Auto Exposure) Ayarları
 #ifndef UVC_AE_TARGET_LUMA
 #define UVC_AE_TARGET_LUMA 126
 #endif
@@ -204,7 +202,6 @@ namespace uvc {
         using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
         auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
         if (fn) {
-            // FIXED_SOURCE = 1
             (void) fn(win, fps, 1);
         }
         dlclose(h);
@@ -293,15 +290,13 @@ namespace uvc {
         return (uint8_t) (v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 
-    // --- KALİTE AYARLARI ---
     static constexpr bool UVC_PREFER_YUYV_SHARPNESS = true;
-    static constexpr int UVC_MIN_OK_FPS_FOR_YUYV = 30; // 30 FPS altı YUYV kabul etme
+    static constexpr int UVC_MIN_OK_FPS_FOR_YUYV = 30;
     static constexpr double UVC_SEAM_SIGMA_X = 2.0;
     static constexpr double UVC_SEAM_SIGMA_Y = 0.8;
 
-    // GÜRÜLTÜYÜ AZALTMAK İÇİN SHARPENING'İ DÜŞÜRDÜM
     static constexpr double UVC_SHARP_SIGMA = 1.0;
-    static constexpr double UVC_SHARP_AMOUNT = 0.25; // 0.60 -> 0.25 (Gürültüye karşı)
+    static constexpr double UVC_SHARP_AMOUNT = 0.25;
 
     static inline void setAlphaRect(cv::Mat &rgba, const cv::Rect &r, uint8_t a) {
         if (rgba.empty()) return;
@@ -320,17 +315,13 @@ namespace uvc {
         if (rgba.empty()) return;
         seamPx = std::clamp(seamPx, 1, rgba.rows);
 
-        // önce tüm frame opak olsun
         setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
 
-        // seam ROI: UVC'nin üst kısmı
         cv::Rect seamR(0, 0, rgba.cols, seamPx);
         cv::Mat seam = rgba(seamR);
 
-        // seam bölgesini yumuşat
         cv::GaussianBlur(seam, seam, cv::Size(0, 0), UVC_SEAM_SIGMA_X, UVC_SEAM_SIGMA_Y);
 
-        // alpha feather: 0 -> 255
         for (int y = 0; y < seamPx; ++y) {
             uint8_t a = (seamPx == 1) ? 255 : (uint8_t) std::lround(
                     255.0 * (double) y / (double) (seamPx - 1));
@@ -340,7 +331,6 @@ namespace uvc {
             }
         }
 
-        // seam altından itibaren alpha kesin opak
         if (seamPx < rgba.rows) {
             setAlphaRect(rgba, cv::Rect(0, seamPx, rgba.cols, rgba.rows - seamPx), 255);
         }
@@ -353,7 +343,6 @@ namespace uvc {
 
         cv::Mat roi = rgba(rr);
 
-        // RGBA split -> sadece RGB sharpen, A aynen kalsın
         std::vector<cv::Mat> ch;
         cv::split(roi, ch);
         if (ch.size() != 4) return;
@@ -370,16 +359,13 @@ namespace uvc {
     static inline void applyUvcSeamAndEdgeProcessing(cv::Mat &rgba) {
         if (rgba.empty()) return;
 
-        // 1) önce full opak
         setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
 
-        // 2) UVC üst kenarda feather
         const int seamPx = std::min(UVC_SEAM_PX, rgba.rows);
         if (seamPx > 0) {
             applyTopSeamFeather(rgba, seamPx);
         }
 
-        // 3) Kenar sharpen
         const int edge = std::min(UVC_EDGE_PX, std::min(rgba.cols / 3, rgba.rows / 3));
         if (edge <= 0) return;
 
@@ -391,7 +377,6 @@ namespace uvc {
             unsharpRect(rgba, cv::Rect(rgba.cols - edge, y0, edge, h0));
         }
 
-        // alt kenar
         unsharpRect(rgba, cv::Rect(0, rgba.rows - edge, rgba.cols, edge));
     }
 
@@ -688,11 +673,6 @@ namespace uvc {
     static std::vector<ModeCand> buildCandidates(int fd, int desiredFps) {
         std::vector<ModeCand> out;
 
-        // ÖNCELİK YUYV'DE. MJPEG'İ LİSTEDEN ÇIKARDIM (VEYA EN SONA ATABİLİRDİM)
-        // Arducam B07 gibi sensörler YUYV'de gürültüsüz çalışır.
-        // Eğer YUYV hiç bulamazsa MJPEG fallback'i aşağıda eklenebilir ama
-        // gürültüden kurtulmak için YUYV şart.
-
         const uint32_t fmts[] = {V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_MJPEG};
 
         for (uint32_t f: fmts) {
@@ -718,9 +698,7 @@ namespace uvc {
             }
         }
 
-        // Sıralama: YUYV ÖNCE GELMELİ.
         std::sort(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
-            // YUYV tercih ediliyor (değeri MJPEG'den farklıdır, genelde daha büyük/küçük olabilir ama explicit kontrol daha iyi)
             bool aIsYuyv = (a.f == V4L2_PIX_FMT_YUYV);
             bool bIsYuyv = (b.f == V4L2_PIX_FMT_YUYV);
             if (aIsYuyv != bIsYuyv) return aIsYuyv > bIsYuyv;
@@ -729,12 +707,10 @@ namespace uvc {
             return a.h < b.h;
         });
 
-        // Unique temizliği
         out.erase(std::unique(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
             return a.f == b.f && a.w == b.w && a.h == b.h;
         }), out.end());
 
-        // En iyi adayı seçme (ScoreMeet > Area > FPS > YUYV)
         std::sort(out.begin(), out.end(), [desiredFps](const ModeCand &a, const ModeCand &b) {
             if (a.scoreMeet != b.scoreMeet) return a.scoreMeet > b.scoreMeet;
 
@@ -742,7 +718,6 @@ namespace uvc {
             long long bb = (long long) b.w * (long long) b.h;
             if (aa != bb) return aa > bb;
 
-            // YUYV tercih et
             bool aIsYuyv = (a.f == V4L2_PIX_FMT_YUYV);
             bool bIsYuyv = (b.f == V4L2_PIX_FMT_YUYV);
             if (aIsYuyv != bIsYuyv) return aIsYuyv > bIsYuyv;
@@ -813,11 +788,7 @@ namespace uvc {
         int bestW = 0, bestH = 0;
         uint32_t bestFourcc = 0;
 
-        // Tek bir döngüde en iyisini seçiyoruz (Zaten buildCandidates sıralı)
         for (const auto &c: cands) {
-            // YUYV öncelikli olduğu için ilk bulduğumuz ve setFormat yapabildiğimiz
-            // aday bizim için en iyisidir (listeyi ona göre sıraladık).
-
             if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
 
             int tryFps = want;
@@ -835,7 +806,7 @@ namespace uvc {
             bestW = (int) fmt.fmt.pix.width;
             bestH = (int) fmt.fmt.pix.height;
             bestFourcc = fmt.fmt.pix.pixelformat;
-            break; // En iyi adayı bulduk (liste sıralıydı)
+            break;
         }
 
         if (!ok) {
@@ -854,7 +825,7 @@ namespace uvc {
         gChosenH.store(cropH, std::memory_order_relaxed);
 
         v4l2_requestbuffers req{};
-        req.count = 8; // Buffer sayısını 12'den 8'e düşürdüm (YUYV büyük yer kaplar)
+        req.count = 8;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
         if (xioctl(gFd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) {
@@ -892,7 +863,6 @@ namespace uvc {
         }
 
         if (gWin) {
-            // Buffer Formatı Back Kamera ile Eşitlendi: RGBA_8888 (Explicit)
             (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH,
                                                     AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
             int fps = gChosenFps.load(std::memory_order_relaxed);
@@ -942,7 +912,6 @@ namespace uvc {
                 const uint8_t *src = (const uint8_t *) gBufs[b.index].ptr;
                 int used = (int) b.bytesused;
 
-                // AE sadece YUYV için aktif (MJPEG'te donanım AE kullanıyoruz)
                 if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
                     gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -987,7 +956,6 @@ namespace uvc {
             int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
             if (cropH <= 0) cropH = 1;
 
-            // YUYV: En temiz, sıkıştırmasız görüntü. Önceliğimiz bu.
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
@@ -996,7 +964,6 @@ namespace uvc {
                         if (rgbaReuse.empty() || rgbaReuse.cols != gW || rgbaReuse.rows != gH) {
                             rgbaReuse = cv::Mat(gH, gW, CV_8UC4);
                         }
-                        // YUY2 -> RGBA dönüşümü
                         cv::cvtColor(yuyv, rgbaReuse, cv::COLOR_YUV2RGBA_YUY2);
 
                         cv::Rect roi(0, 0, gW, cropH);
@@ -1011,7 +978,6 @@ namespace uvc {
                 continue;
             }
 
-            // MJPEG: Yedek plan. Gürültülü olabilir.
             if (f == V4L2_PIX_FMT_MJPEG) {
                 try {
                     cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
@@ -1022,10 +988,6 @@ namespace uvc {
                             rgbaReuse = cv::Mat(bgr.rows, bgr.cols, CV_8UC4);
                         }
                         cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
-
-                        // MJPEG modunda AE yazılım yerine donanımda kalsın, luma check sadece info için
-                        // int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
-                        // autoExposureMaybeAdjust(avg);
 
                         cv::Rect roi(0, 0, bgr.cols, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
@@ -1040,7 +1002,6 @@ namespace uvc {
         }
     }
 
-    // ... (start, stop vb. fonksiyonlar aynı) ...
     bool start(JNIEnv *env, jobject surface, int desiredFps) {
         std::lock_guard<std::mutex> lk(gLock);
         clearErrLocked();

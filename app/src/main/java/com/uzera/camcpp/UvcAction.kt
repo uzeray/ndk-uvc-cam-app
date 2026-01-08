@@ -4,13 +4,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.res.Configuration
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbManager
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import android.view.TextureView
@@ -19,7 +16,6 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
 
 class UvcAction(
     private val activity: AppCompatActivity,
@@ -34,8 +30,6 @@ class UvcAction(
 
     private val extStarted = AtomicBoolean(false)
     private val extStarting = AtomicBoolean(false)
-
-    private val uiHandler = Handler(Looper.getMainLooper())
 
     private var extModeCache: String = ""
     private var extFmtCache: String = ""
@@ -101,7 +95,6 @@ class UvcAction(
         if (Build.VERSION.SDK_INT >= 33) {
             activity.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            @Suppress("DEPRECATION")
             activity.registerReceiver(usbReceiver, filter)
         }
     }
@@ -122,7 +115,7 @@ class UvcAction(
         stopExt()
     }
 
-    fun onConfigurationChanged(newConfig: Configuration) {
+    fun onConfigurationChanged() {
         applyExtTransform()
     }
 
@@ -194,7 +187,7 @@ class UvcAction(
         val TRIM_RIGHT_PX = 15f
         kx = kx - (TRIM_RIGHT_PX / vwF)
 
-        val LEFT_ANCHOR_PX = 0f   // -12f yaparsan 12px sola kayar
+        val LEFT_ANCHOR_PX = 0f
 
         val Y_OVERLAP_FIX_PX = 1f
 

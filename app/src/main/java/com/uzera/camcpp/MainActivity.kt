@@ -8,12 +8,10 @@ import android.os.Bundle
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.TextView
 import android.view.TextureView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.view.marginTop
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -32,7 +30,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var backAction: BackAction
     private lateinit var uvcAction: UvcAction
 
-    // Panel isteklerin (px)
     private val PANEL_W_PX = 2160
     private val PANEL_H_PX = 1600
     private val PANEL_POS_X = 250
@@ -76,13 +73,11 @@ class MainActivity : AppCompatActivity() {
             clipToPadding = true
         }
 
-        // Üst: 2160x800 Back
         stack.addView(
             backTv,
             LinearLayout.LayoutParams(PANEL_W_PX, 800)
         )
 
-        // Alt: 2160x800 UVC
         stack.addView(
             extTv,
             LinearLayout.LayoutParams(PANEL_W_PX, 800)
@@ -108,10 +103,8 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(root)
 
-        // Panel ekran dışına taşarsa scale
         root.post { scalePanelToFitIfNeeded() }
 
-        // --- Actions ---
         backAction = BackAction(
             activity = this,
             backTv = backTv,
@@ -159,8 +152,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        backAction.onConfigurationChanged(newConfig)
-        uvcAction.onConfigurationChanged(newConfig)
+        backAction.onConfigurationChanged()
+        uvcAction.onConfigurationChanged()
         root.post { scalePanelToFitIfNeeded() }
     }
 
