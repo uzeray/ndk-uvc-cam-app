@@ -435,11 +435,14 @@ namespace backcam {
                 ACAMERA_OK && e.count == 2) {
                 int32_t minEv = e.data.i32[0];
                 int32_t maxEv = e.data.i32[1];
-                int32_t targetEv = 2;
+                int32_t targetEv = 0; // +2 sıcak/kırmızı yapabiliyor -> nötrle
                 targetEv = std::max(minEv, std::min(targetEv, maxEv));
-                ACaptureRequest_setEntry_i32(gPreviewRequest,
-                                             ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1,
-                                             &targetEv);
+                (void)ACaptureRequest_setEntry_i32(
+                        gPreviewRequest,
+                        ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION,
+                        1,
+                        &targetEv
+                );
             }
             ACameraMetadata_free(chars);
         }
@@ -449,6 +452,13 @@ namespace backcam {
             (void) ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AE_ANTIBANDING_MODE,
                                                1, &ab);
         }
+
+        {
+            uint8_t awb = ACAMERA_CONTROL_AWB_MODE_FLUORESCENT;
+            (void)ACaptureRequest_setEntry_u8(gPreviewRequest, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
+        }
+
+        uint8_t ccm = ACAMERA_COLOR_CORRECTION_MODE_FAST;
 
         {
             uint8_t vs = ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE_OFF;

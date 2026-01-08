@@ -51,19 +51,19 @@
 #endif
 
 #ifndef UVC_AE_TARGET_LUMA
-#define UVC_AE_TARGET_LUMA 122
+#define UVC_AE_TARGET_LUMA 80
 #endif
 #ifndef UVC_AE_TOL
-#define UVC_AE_TOL 10
+#define UVC_AE_TOL 3
 #endif
 #ifndef UVC_AE_ADJUST_INTERVAL_MS
-#define UVC_AE_ADJUST_INTERVAL_MS 120
+#define UVC_AE_ADJUST_INTERVAL_MS 60
 #endif
 #ifndef UVC_AE_MAX_EXPOSURE_US_CAP
-#define UVC_AE_MAX_EXPOSURE_US_CAP 8000
+#define UVC_AE_MAX_EXPOSURE_US_CAP 2000
 #endif
 #ifndef UVC_AE_MIN_EXPOSURE_US_CAP
-#define UVC_AE_MIN_EXPOSURE_US_CAP 400
+#define UVC_AE_MIN_EXPOSURE_US_CAP 100
 #endif
 
 #define UVC_CROP_HEIGHT_RATIO 1.00f
@@ -282,6 +282,85 @@ namespace uvc {
         return (uint8_t) (v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 
+    static constexpr int    UVC_SEAM_PX      = 10;   // seam band yüksekliği
+    static constexpr int    UVC_EDGE_PX      = 28;   // kenar keskinleştirme bandı
+    static constexpr double UVC_SEAM_SIGMA_X = 2.0;
+    static constexpr double UVC_SEAM_SIGMA_Y = 0.8;
+    static constexpr double UVC_SHARP_SIGMA  = 1.0;
+    static constexpr double UVC_SHARP_AMOUNT = 0.60; // hafif, artefakt üretmez
+
+    static inline void setAlphaRect(cv::Mat& rgba, const cv::Rect& r, uint8_t a) {
+        if (rgba.empty()) return;
+        cv::Rect rr = r & cv::Rect(0, 0, rgba.cols, rgba.rows);
+        if (rr.width <= 0 || rr.height <= 0) return;
+
+        for (int y = rr.y; y < rr.y + rr.height; ++y) {
+            uint8_t* row = rgba.ptr<uint8_t>(y);
+            for (int x = rr.x; x < rr.x + rr.width; ++x) {
+                row[x * 4 + 3] = a;
+            }
+        }
+    }
+
+    static inline void applyTopSeamFeather(cv::Mat& rgba, int seamPx) {
+        if (rgba.empty()) return;
+        seamPx = std::clamp(seamPx, 1, rgba.rows);
+
+        // önce tüm frame opak olsun
+        setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
+
+        // seam ROI: UVC'nin üst kısmı
+        cv::Rect seamR(0, 0, rgba.cols, seamPx);
+        cv::Mat seam = rgba(seamR);
+
+        // seam bölgesini yumuşat (RGB + alpha birlikte blur, sonra alpha'yı tekrar düzenleyeceğiz)
+        cv::GaussianBlur(seam, seam, cv::Size(0, 0), UVC_SEAM_SIGMA_X, UVC_SEAM_SIGMA_Y);
+
+        // alpha feather: 0 -> 255
+        for (int y = 0; y < seamPx; ++y) {
+            uint8_t a = (seamPx == 1) ? 255 : (uint8_t)std::lround(255.0 * (double)y / (double)(seamPx - 1));
+            uint8_t* row = rgba.ptr<uint8_t>(y);
+            for (int x = 0; x < rgba.cols; ++x) {
+                row[x * 4 + 3] = std::min<uint8_t>(row[x * 4 + 3], a);
+            }
+        }
+
+        // seam altından itibaren alpha kesin opak (güvenlik)
+        if (seamPx < rgba.rows) {
+            setAlphaRect(rgba, cv::Rect(0, seamPx, rgba.cols, rgba.rows - seamPx), 255);
+        }
+    }
+
+    static inline void unsharpRect(cv::Mat& rgba, const cv::Rect& r) {
+        if (rgba.empty()) return;
+        cv::Rect rr = r & cv::Rect(0, 0, rgba.cols, rgba.rows);
+        if (rr.width <= 0 || rr.height <= 0) return;
+
+        cv::Mat roi = rgba(rr);
+        cv::Mat blurred;
+        cv::GaussianBlur(roi, blurred, cv::Size(0, 0), UVC_SHARP_SIGMA);
+        cv::addWeighted(roi, 1.0 + UVC_SHARP_AMOUNT, blurred, -UVC_SHARP_AMOUNT, 0.0, roi);
+
+        // Kenar keskinleştirme bandında alpha'yı tekrar opak yap (seam hariç bölgelerde)
+        setAlphaRect(rgba, rr, 255);
+    }
+
+    static inline void applyUvcSeamAndEdgeProcessing(cv::Mat& rgba) {
+        if (rgba.empty()) return;
+
+        // Seam feather kapalı: tüm frame opak
+        setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
+
+        const int edge = std::min(UVC_EDGE_PX, std::min(rgba.cols / 3, rgba.rows / 3));
+        if (edge <= 0) return;
+
+        // Kenar sharpen devam edebilir
+        unsharpRect(rgba, cv::Rect(0, 0, edge, rgba.rows));
+        unsharpRect(rgba, cv::Rect(rgba.cols - edge, 0, edge, rgba.rows));
+        unsharpRect(rgba, cv::Rect(0, rgba.rows - edge, rgba.cols, edge));
+    }
+
+
     static int avgLumaYuyvSample(const uint8_t *yuyv, int w, int h) {
         if (!yuyv || w <= 0 || h <= 0) return 0;
         const int stepX = std::max(1, w / 64);
@@ -323,7 +402,7 @@ namespace uvc {
         if (!exp.ok) return 0;
         fps = std::max(1, fps);
         double frameUs = 1000000.0 / (double) fps;
-        int capUs = (int) std::floor(frameUs * 0.80);
+        int capUs = (int) std::floor(frameUs * 0.65);
         capUs = std::clamp(capUs, UVC_AE_MIN_EXPOSURE_US_CAP, UVC_AE_MAX_EXPOSURE_US_CAP);
         int capAbs = capUs / 100;
         capAbs = std::clamp(capAbs, exp.minV, exp.maxV);
@@ -443,6 +522,19 @@ namespace uvc {
             }
         }
 
+        {
+            v4l2_queryctrl qc{};
+            if (queryCtrl(fd, V4L2_CID_BRIGHTNESS, qc)) {
+                (void)setCtrl(fd, V4L2_CID_BRIGHTNESS, (int)qc.default_value);
+            }
+            if (queryCtrl(fd, V4L2_CID_CONTRAST, qc)) {
+                (void)setCtrl(fd, V4L2_CID_CONTRAST, (int)qc.default_value);
+            }
+            if (queryCtrl(fd, V4L2_CID_SATURATION, qc)) {
+                (void)setCtrl(fd, V4L2_CID_SATURATION, (int)qc.default_value);
+            }
+        }
+
         (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
 
         trySetJpegQualityMax(fd);
@@ -468,14 +560,17 @@ namespace uvc {
             const int expCap = exposureCapAbsForFps(fps, gExpAbs);
 
             if (gExpAbs.ok && expCap > 0) {
-                int initExp = gExpAbs.minV + (expCap - gExpAbs.minV) / 2;
+                // cap'in %30’u ile başla (daha güvenli, patlama yapmaz)
+                int initExp = gExpAbs.minV + (int)((expCap - gExpAbs.minV) * 0.30f);
                 initExp = clampToRange(gExpAbs, initExp);
                 if (setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, initExp)) {
                     gCurExpAbs.store(initExp, std::memory_order_relaxed);
                 }
             }
+
             if (gGain.ok) {
-                int initGain = gGain.minV + (gGain.maxV - gGain.minV) / 4;
+                // gain'i minimuma yakın başlat (parlama/noise artmasını engeller)
+                int initGain = gGain.minV;
                 initGain = clampToRange(gGain, initGain);
                 if (setCtrl(fd, V4L2_CID_GAIN, initGain)) {
                     gCurGain.store(initGain, std::memory_order_relaxed);
@@ -880,13 +975,11 @@ namespace uvc {
                         }
                         cv::cvtColor(yuyv, rgbaReuse, cv::COLOR_YUV2RGBA_YUY2);
 
-                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
-                        autoExposureMaybeAdjust(avg);
-
                         cv::Rect roi(0, 0, gW, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
+                        applyUvcSeamAndEdgeProcessing(cropped);
 
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
@@ -911,6 +1004,7 @@ namespace uvc {
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
+                        applyUvcSeamAndEdgeProcessing(cropped);
 
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }

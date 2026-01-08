@@ -13,6 +13,7 @@ import android.view.TextureView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.marginTop
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -55,11 +56,17 @@ class MainActivity : AppCompatActivity() {
         supportActionBar?.show()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // --- UI'ı kodla kur: R.id.* yok ---
-        backTv = TextureView(this)
-        extTv = TextureView(this)
+        backTv = TextureView(this).apply {
+            translationY = 14f
+        }
 
-        extTv.translationY = -35f
+        extTv = TextureView(this).apply {
+            setOpaque(true)
+            translationY = -30f
+        }
+        // backTv.translationZ = 0f
+
+
 
         val stack = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
