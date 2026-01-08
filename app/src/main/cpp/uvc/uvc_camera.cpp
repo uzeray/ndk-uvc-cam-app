@@ -537,49 +537,64 @@ namespace uvc {
 
         (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
 
+        const bool isMjpeg = (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_MJPEG);
+
         trySetJpegQualityMax(fd);
 
         {
             v4l2_queryctrl qc{};
             bool expAutoOk = queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc);
-            bool expAbsOk = queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc);
-            bool gainOk = queryCtrl(fd, V4L2_CID_GAIN, qc);
-            bool autogOk = queryCtrl(fd, V4L2_CID_AUTOGAIN, qc);
+            bool expAbsOk  = queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc);
+            bool gainOk    = queryCtrl(fd, V4L2_CID_GAIN, qc);
+            bool autogOk   = queryCtrl(fd, V4L2_CID_AUTOGAIN, qc);
 
             gExpAbs = readRange(fd, V4L2_CID_EXPOSURE_ABSOLUTE);
-            gGain = readRange(fd, V4L2_CID_GAIN);
+            gGain   = readRange(fd, V4L2_CID_GAIN);
 
-            if (expAutoOk && expAbsOk) {
-                (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
-            }
-            if (autogOk) {
-                (void) setCtrl(fd, V4L2_CID_AUTOGAIN, 0);
-            }
-
-            const int fps = chosenFps > 0 ? chosenFps : 60;
-            const int expCap = exposureCapAbsForFps(fps, gExpAbs);
-
-            if (gExpAbs.ok && expCap > 0) {
-                // cap'in %30’u ile başla (daha güvenli, patlama yapmaz)
-                int initExp = gExpAbs.minV + (int)((expCap - gExpAbs.minV) * 0.30f);
-                initExp = clampToRange(gExpAbs, initExp);
-                if (setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, initExp)) {
-                    gCurExpAbs.store(initExp, std::memory_order_relaxed);
+            // MJPEG'te önce donanım AE + autogain kullan (ani patlamayı en iyi bu çözer)
+            if (isMjpeg) {
+                if (expAutoOk) {
+                    (void)setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
                 }
-            }
-
-            if (gGain.ok) {
-                // gain'i minimuma yakın başlat (parlama/noise artmasını engeller)
-                int initGain = gGain.minV;
-                initGain = clampToRange(gGain, initGain);
-                if (setCtrl(fd, V4L2_CID_GAIN, initGain)) {
-                    gCurGain.store(initGain, std::memory_order_relaxed);
+                if (autogOk) {
+                    (void)setCtrl(fd, V4L2_CID_AUTOGAIN, 1);
                 }
+                // MJPEG'te custom AE kapalı
+                gAeEnabled.store(false, std::memory_order_relaxed);
+            } else {
+                // (YUYV kullanmıyorsun ama yine de güvenli fallback)
+                if (expAutoOk && expAbsOk) {
+                    (void)setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+                }
+                if (autogOk) {
+                    (void)setCtrl(fd, V4L2_CID_AUTOGAIN, 0);
+                }
+
+                const int fps    = chosenFps > 0 ? chosenFps : 60;
+                const int expCap = exposureCapAbsForFps(fps, gExpAbs);
+
+                if (gExpAbs.ok && expCap > 0) {
+                    int initExp = gExpAbs.minV + (int)((expCap - gExpAbs.minV) * 0.25f);
+                    initExp = clampToRange(gExpAbs, initExp);
+                    if (setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, initExp)) {
+                        gCurExpAbs.store(initExp, std::memory_order_relaxed);
+                    }
+                }
+                if (gGain.ok) {
+                    int initGain = gGain.minV;
+                    initGain = clampToRange(gGain, initGain);
+                    if (setCtrl(fd, V4L2_CID_GAIN, initGain)) {
+                        gCurGain.store(initGain, std::memory_order_relaxed);
+                    }
+                }
+
+                gAeEnabled.store(gExpAbs.ok || gGain.ok, std::memory_order_relaxed);
             }
 
-            gAeEnabled.store(gExpAbs.ok || gGain.ok, std::memory_order_relaxed);
-            (void) gainOk;
+            (void)gainOk;
         }
+
+
     }
 
     static std::vector<std::pair<int, int>> enumFrameSizes(int fd, uint32_t pixfmt) {
@@ -997,8 +1012,6 @@ namespace uvc {
                         }
                         cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
 
-                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
-                        autoExposureMaybeAdjust(avg);
 
                         cv::Rect roi(0, 0, bgr.cols, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
