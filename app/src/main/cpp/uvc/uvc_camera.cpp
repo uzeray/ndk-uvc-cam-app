@@ -32,6 +32,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+// V4L2 Tanımları (Eksikse diye)
 #ifndef V4L2_CID_JPEG_COMPRESSION_QUALITY
 #define V4L2_CID_JPEG_COMPRESSION_QUALITY 0x009f090d
 #endif
@@ -50,17 +51,18 @@
 #define V4L2_CID_POWER_LINE_FREQUENCY_50HZ 1
 #endif
 
+// AE (Auto Exposure) Ayarları
 #ifndef UVC_AE_TARGET_LUMA
-#define UVC_AE_TARGET_LUMA 250
+#define UVC_AE_TARGET_LUMA 126
 #endif
 #ifndef UVC_AE_TOL
-#define UVC_AE_TOL 6
+#define UVC_AE_TOL 10
 #endif
 #ifndef UVC_AE_ADJUST_INTERVAL_MS
 #define UVC_AE_ADJUST_INTERVAL_MS 60
 #endif
 #ifndef UVC_AE_MAX_EXPOSURE_US_CAP
-#define UVC_AE_MAX_EXPOSURE_US_CAP 2000
+#define UVC_AE_MAX_EXPOSURE_US_CAP 16000
 #endif
 #ifndef UVC_AE_MIN_EXPOSURE_US_CAP
 #define UVC_AE_MIN_EXPOSURE_US_CAP 100
@@ -122,6 +124,7 @@ namespace uvc {
     static std::atomic<long long> gLastAeAdjustNs{0};
 
     static void setErrLocked(const std::string &s) { gLastError = s; }
+
     static void clearErrLocked() { gLastError.clear(); }
 
     static int xioctl(int fd, unsigned long req, void *arg) {
@@ -201,7 +204,8 @@ namespace uvc {
         using Fn = int32_t (*)(ANativeWindow *, float, int32_t);
         auto fn = reinterpret_cast<Fn>(dlsym(h, "ANativeWindow_setFrameRate"));
         if (fn) {
-            (void) fn(win, fps, (int32_t) ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+            // FIXED_SOURCE = 1
+            (void) fn(win, fps, 1);
         }
         dlclose(h);
     }
@@ -289,27 +293,30 @@ namespace uvc {
         return (uint8_t) (v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 
+    // --- KALİTE AYARLARI ---
     static constexpr bool UVC_PREFER_YUYV_SHARPNESS = true;
-    static constexpr int  UVC_MIN_OK_FPS_FOR_YUYV   = 30;
+    static constexpr int UVC_MIN_OK_FPS_FOR_YUYV = 30; // 30 FPS altı YUYV kabul etme
     static constexpr double UVC_SEAM_SIGMA_X = 2.0;
     static constexpr double UVC_SEAM_SIGMA_Y = 0.8;
-    static constexpr double UVC_SHARP_SIGMA  = 1.0;
-    static constexpr double UVC_SHARP_AMOUNT = 0.60; // hafif, artefakt üretmez
 
-    static inline void setAlphaRect(cv::Mat& rgba, const cv::Rect& r, uint8_t a) {
+    // GÜRÜLTÜYÜ AZALTMAK İÇİN SHARPENING'İ DÜŞÜRDÜM
+    static constexpr double UVC_SHARP_SIGMA = 1.0;
+    static constexpr double UVC_SHARP_AMOUNT = 0.25; // 0.60 -> 0.25 (Gürültüye karşı)
+
+    static inline void setAlphaRect(cv::Mat &rgba, const cv::Rect &r, uint8_t a) {
         if (rgba.empty()) return;
         cv::Rect rr = r & cv::Rect(0, 0, rgba.cols, rgba.rows);
         if (rr.width <= 0 || rr.height <= 0) return;
 
         for (int y = rr.y; y < rr.y + rr.height; ++y) {
-            uint8_t* row = rgba.ptr<uint8_t>(y);
+            uint8_t *row = rgba.ptr<uint8_t>(y);
             for (int x = rr.x; x < rr.x + rr.width; ++x) {
                 row[x * 4 + 3] = a;
             }
         }
     }
 
-    static inline void applyTopSeamFeather(cv::Mat& rgba, int seamPx) {
+    static inline void applyTopSeamFeather(cv::Mat &rgba, int seamPx) {
         if (rgba.empty()) return;
         seamPx = std::clamp(seamPx, 1, rgba.rows);
 
@@ -320,25 +327,26 @@ namespace uvc {
         cv::Rect seamR(0, 0, rgba.cols, seamPx);
         cv::Mat seam = rgba(seamR);
 
-        // seam bölgesini yumuşat (RGB + alpha birlikte blur, sonra alpha'yı tekrar düzenleyeceğiz)
+        // seam bölgesini yumuşat
         cv::GaussianBlur(seam, seam, cv::Size(0, 0), UVC_SEAM_SIGMA_X, UVC_SEAM_SIGMA_Y);
 
         // alpha feather: 0 -> 255
         for (int y = 0; y < seamPx; ++y) {
-            uint8_t a = (seamPx == 1) ? 255 : (uint8_t)std::lround(255.0 * (double)y / (double)(seamPx - 1));
-            uint8_t* row = rgba.ptr<uint8_t>(y);
+            uint8_t a = (seamPx == 1) ? 255 : (uint8_t) std::lround(
+                    255.0 * (double) y / (double) (seamPx - 1));
+            uint8_t *row = rgba.ptr<uint8_t>(y);
             for (int x = 0; x < rgba.cols; ++x) {
                 row[x * 4 + 3] = std::min<uint8_t>(row[x * 4 + 3], a);
             }
         }
 
-        // seam altından itibaren alpha kesin opak (güvenlik)
+        // seam altından itibaren alpha kesin opak
         if (seamPx < rgba.rows) {
             setAlphaRect(rgba, cv::Rect(0, seamPx, rgba.cols, rgba.rows - seamPx), 255);
         }
     }
 
-    static inline void unsharpRect(cv::Mat& rgba, const cv::Rect& r) {
+    static inline void unsharpRect(cv::Mat &rgba, const cv::Rect &r) {
         if (rgba.empty()) return;
         cv::Rect rr = r & cv::Rect(0, 0, rgba.cols, rgba.rows);
         if (rr.width <= 0 || rr.height <= 0) return;
@@ -359,32 +367,31 @@ namespace uvc {
         cv::merge(ch, roi);
     }
 
-    static inline void applyUvcSeamAndEdgeProcessing(cv::Mat& rgba) {
+    static inline void applyUvcSeamAndEdgeProcessing(cv::Mat &rgba) {
         if (rgba.empty()) return;
 
         // 1) önce full opak
         setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
 
-        // 2) UVC üst kenarda feather (0 -> 255) + blur
+        // 2) UVC üst kenarda feather
         const int seamPx = std::min(UVC_SEAM_PX, rgba.rows);
         if (seamPx > 0) {
             applyTopSeamFeather(rgba, seamPx);
         }
 
-        // 3) Kenar sharpen (seam bölgesine dokunma)
+        // 3) Kenar sharpen
         const int edge = std::min(UVC_EDGE_PX, std::min(rgba.cols / 3, rgba.rows / 3));
         if (edge <= 0) return;
 
-        const int y0 = seamPx;                         // üst seam sonrası
-        const int h0 = std::max(0, rgba.rows - seamPx); // kalan yükseklik
+        const int y0 = seamPx;
+        const int h0 = std::max(0, rgba.rows - seamPx);
 
         if (h0 > 0) {
-            // sol/sağ kenar: seam'i exclude et
             unsharpRect(rgba, cv::Rect(0, y0, edge, h0));
             unsharpRect(rgba, cv::Rect(rgba.cols - edge, y0, edge, h0));
         }
 
-        // alt kenar (tam genişlik)
+        // alt kenar
         unsharpRect(rgba, cv::Rect(0, rgba.rows - edge, rgba.cols, edge));
     }
 
@@ -553,13 +560,13 @@ namespace uvc {
         {
             v4l2_queryctrl qc{};
             if (queryCtrl(fd, V4L2_CID_BRIGHTNESS, qc)) {
-                (void)setCtrl(fd, V4L2_CID_BRIGHTNESS, (int)qc.default_value);
+                (void) setCtrl(fd, V4L2_CID_BRIGHTNESS, (int) qc.default_value);
             }
             if (queryCtrl(fd, V4L2_CID_CONTRAST, qc)) {
-                (void)setCtrl(fd, V4L2_CID_CONTRAST, (int)qc.default_value);
+                (void) setCtrl(fd, V4L2_CID_CONTRAST, (int) qc.default_value);
             }
             if (queryCtrl(fd, V4L2_CID_SATURATION, qc)) {
-                (void)setCtrl(fd, V4L2_CID_SATURATION, (int)qc.default_value);
+                (void) setCtrl(fd, V4L2_CID_SATURATION, (int) qc.default_value);
             }
         }
 
@@ -571,37 +578,34 @@ namespace uvc {
         {
             v4l2_queryctrl qc{};
             bool expAutoOk = queryCtrl(fd, V4L2_CID_EXPOSURE_AUTO, qc);
-            bool expAbsOk  = queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc);
-            bool gainOk    = queryCtrl(fd, V4L2_CID_GAIN, qc);
-            bool autogOk   = queryCtrl(fd, V4L2_CID_AUTOGAIN, qc);
+            bool expAbsOk = queryCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, qc);
+            bool gainOk = queryCtrl(fd, V4L2_CID_GAIN, qc);
+            bool autogOk = queryCtrl(fd, V4L2_CID_AUTOGAIN, qc);
 
             gExpAbs = readRange(fd, V4L2_CID_EXPOSURE_ABSOLUTE);
-            gGain   = readRange(fd, V4L2_CID_GAIN);
+            gGain = readRange(fd, V4L2_CID_GAIN);
 
-            // MJPEG'te önce donanım AE + autogain kullan (ani patlamayı en iyi bu çözer)
             if (isMjpeg) {
                 if (expAutoOk) {
-                    (void)setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
+                    (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
                 }
                 if (autogOk) {
-                    (void)setCtrl(fd, V4L2_CID_AUTOGAIN, 1);
+                    (void) setCtrl(fd, V4L2_CID_AUTOGAIN, 1);
                 }
-                // MJPEG'te custom AE kapalı
                 gAeEnabled.store(false, std::memory_order_relaxed);
             } else {
-                // (YUYV kullanmıyorsun ama yine de güvenli fallback)
                 if (expAutoOk && expAbsOk) {
-                    (void)setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+                    (void) setCtrl(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
                 }
                 if (autogOk) {
-                    (void)setCtrl(fd, V4L2_CID_AUTOGAIN, 0);
+                    (void) setCtrl(fd, V4L2_CID_AUTOGAIN, 0);
                 }
 
-                const int fps    = chosenFps > 0 ? chosenFps : 60;
+                const int fps = chosenFps > 0 ? chosenFps : 60;
                 const int expCap = exposureCapAbsForFps(fps, gExpAbs);
 
                 if (gExpAbs.ok && expCap > 0) {
-                    int initExp = gExpAbs.minV + (int)((expCap - gExpAbs.minV) * 0.25f);
+                    int initExp = gExpAbs.minV + (int) ((expCap - gExpAbs.minV) * 0.25f);
                     initExp = clampToRange(gExpAbs, initExp);
                     if (setCtrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, initExp)) {
                         gCurExpAbs.store(initExp, std::memory_order_relaxed);
@@ -617,44 +621,31 @@ namespace uvc {
 
                 gAeEnabled.store(gExpAbs.ok || gGain.ok, std::memory_order_relaxed);
             }
-
-            (void)gainOk;
         }
-
-
     }
 
     static std::vector<std::pair<int, int>> enumFrameSizes(int fd, uint32_t pixfmt) {
         std::vector<std::pair<int, int>> out;
-
         v4l2_frmsizeenum fse{};
         fse.pixel_format = pixfmt;
-
         for (fse.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fse) == 0; fse.index++) {
             if (fse.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
                 out.emplace_back((int) fse.discrete.width, (int) fse.discrete.height);
             } else if (fse.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
                        fse.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
-                int minW = (int) fse.stepwise.min_width;
                 int maxW = (int) fse.stepwise.max_width;
-                int minH = (int) fse.stepwise.min_height;
                 int maxH = (int) fse.stepwise.max_height;
-
                 out.emplace_back(maxW, maxH);
-
-                const std::pair<int, int> common[] = {
-                        {1920,  1080}
-                };
+                const std::pair<int, int> common[] = {{1920, 1080}};
                 for (auto &c: common) {
-                    if (c.first >= minW && c.first <= maxW && c.second >= minH &&
-                        c.second <= maxH) {
+                    if (c.first >= (int) fse.stepwise.min_width && c.first <= maxW &&
+                        c.second >= (int) fse.stepwise.min_height && c.second <= maxH) {
                         out.emplace_back(c.first, c.second);
                     }
                 }
                 break;
             }
         }
-
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
         return out;
@@ -666,22 +657,19 @@ namespace uvc {
         fie.pixel_format = pixfmt;
         fie.width = (uint32_t) w;
         fie.height = (uint32_t) h;
-
         for (fie.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fie) == 0; fie.index++) {
             if (fie.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
                 int num = (int) fie.discrete.numerator;
                 int den = (int) fie.discrete.denominator;
                 if (num > 0 && den > 0) {
-                    int fps = den / num;
-                    best = std::max(best, fps);
+                    best = std::max(best, den / num);
                 }
             } else if (fie.type == V4L2_FRMIVAL_TYPE_STEPWISE ||
                        fie.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
                 int num = (int) fie.stepwise.min.numerator;
                 int den = (int) fie.stepwise.min.denominator;
                 if (num > 0 && den > 0) {
-                    int fps = den / num;
-                    best = std::max(best, fps);
+                    best = std::max(best, den / num);
                 }
                 break;
             }
@@ -699,15 +687,18 @@ namespace uvc {
 
     static std::vector<ModeCand> buildCandidates(int fd, int desiredFps) {
         std::vector<ModeCand> out;
-        const uint32_t fmts[] = {V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_YUYV};
+
+        // ÖNCELİK YUYV'DE. MJPEG'İ LİSTEDEN ÇIKARDIM (VEYA EN SONA ATABİLİRDİM)
+        // Arducam B07 gibi sensörler YUYV'de gürültüsüz çalışır.
+        // Eğer YUYV hiç bulamazsa MJPEG fallback'i aşağıda eklenebilir ama
+        // gürültüden kurtulmak için YUYV şart.
+
+        const uint32_t fmts[] = {V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_MJPEG};
 
         for (uint32_t f: fmts) {
             auto sizes = enumFrameSizes(fd, f);
-
-            if (sizes.empty()) {
-                const std::pair<int, int> fallback[] = {
-                        {1920, 1080}
-                };
+            if (sizes.empty() && f == V4L2_PIX_FMT_MJPEG) {
+                const std::pair<int, int> fallback[] = {{1920, 1080}};
                 sizes.assign(std::begin(fallback), std::end(fallback));
             }
 
@@ -727,15 +718,23 @@ namespace uvc {
             }
         }
 
+        // Sıralama: YUYV ÖNCE GELMELİ.
         std::sort(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
-            if (a.f != b.f) return a.f < b.f;
+            // YUYV tercih ediliyor (değeri MJPEG'den farklıdır, genelde daha büyük/küçük olabilir ama explicit kontrol daha iyi)
+            bool aIsYuyv = (a.f == V4L2_PIX_FMT_YUYV);
+            bool bIsYuyv = (b.f == V4L2_PIX_FMT_YUYV);
+            if (aIsYuyv != bIsYuyv) return aIsYuyv > bIsYuyv;
+
             if (a.w != b.w) return a.w < b.w;
             return a.h < b.h;
         });
+
+        // Unique temizliği
         out.erase(std::unique(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
             return a.f == b.f && a.w == b.w && a.h == b.h;
         }), out.end());
 
+        // En iyi adayı seçme (ScoreMeet > Area > FPS > YUYV)
         std::sort(out.begin(), out.end(), [desiredFps](const ModeCand &a, const ModeCand &b) {
             if (a.scoreMeet != b.scoreMeet) return a.scoreMeet > b.scoreMeet;
 
@@ -743,10 +742,12 @@ namespace uvc {
             long long bb = (long long) b.w * (long long) b.h;
             if (aa != bb) return aa > bb;
 
+            // YUYV tercih et
+            bool aIsYuyv = (a.f == V4L2_PIX_FMT_YUYV);
+            bool bIsYuyv = (b.f == V4L2_PIX_FMT_YUYV);
+            if (aIsYuyv != bIsYuyv) return aIsYuyv > bIsYuyv;
+
             if (a.maxFps != b.maxFps) return a.maxFps > b.maxFps;
-
-            if (a.f != b.f) return (a.f == V4L2_PIX_FMT_MJPEG);
-
             return false;
         });
 
@@ -762,42 +763,34 @@ namespace uvc {
             if (b.ptr && b.len) munmap(b.ptr, b.len);
         }
         gBufs.clear();
-
         if (gFd >= 0) {
             close(gFd);
             gFd = -1;
         }
-
         if (gWin) {
             ANativeWindow_release(gWin);
             gWin = nullptr;
         }
-
         {
             std::lock_guard<std::mutex> lk(gFrameLock);
             gFrameBytes.clear();
             gFrameReady.store(false, std::memory_order_relaxed);
         }
-
         gLastFrameTsNs.store(0, std::memory_order_relaxed);
         gPrevFrameTsNs.store(0, std::memory_order_relaxed);
         gFpsX100.store(0, std::memory_order_relaxed);
-
         gChosenFps.store(0, std::memory_order_relaxed);
         gChosenFourcc.store(0, std::memory_order_relaxed);
         gChosenW.store(0, std::memory_order_relaxed);
         gChosenH.store(0, std::memory_order_relaxed);
-
         gAeEnabled.store(false, std::memory_order_relaxed);
         gExpAbs = {};
         gGain = {};
         gCurExpAbs.store(0, std::memory_order_relaxed);
         gCurGain.store(0, std::memory_order_relaxed);
         gLastAeAdjustNs.store(0, std::memory_order_relaxed);
-
         gW = 0;
         gH = 0;
-
         std::lock_guard<std::mutex> lk(gLock);
         gLastError.clear();
     }
@@ -820,68 +813,29 @@ namespace uvc {
         int bestW = 0, bestH = 0;
         uint32_t bestFourcc = 0;
 
-        auto tryPick = [&](bool onlyYuyv) -> bool {
-            bool okLocal = false;
+        // Tek bir döngüde en iyisini seçiyoruz (Zaten buildCandidates sıralı)
+        for (const auto &c: cands) {
+            // YUYV öncelikli olduğu için ilk bulduğumuz ve setFormat yapabildiğimiz
+            // aday bizim için en iyisidir (listeyi ona göre sıraladık).
 
-            int localBestGotFps = 0;
-            v4l2_format localBestFmt{};
-            int localBestW = 0, localBestH = 0;
-            uint32_t localBestFourcc = 0;
+            if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
 
-            for (const auto &c : cands) {
-                if (onlyYuyv && c.f != V4L2_PIX_FMT_YUYV) continue;
+            int tryFps = want;
+            if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
+            trySetFps(gFd, tryFps);
+            trySetJpegQualityMax(gFd);
 
-                // YUYV için: enumMaxFpsFor > 0 ise ve < 30 ise ele
-                if (onlyYuyv && c.maxFps > 0 && c.maxFps < UVC_MIN_OK_FPS_FOR_YUYV) continue;
+            int got = readFps(gFd, tryFps);
 
-                if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
+            applyControls(gFd, got, fmt.fmt.pix.pixelformat);
 
-                int tryFps = want;
-                if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
-                trySetFps(gFd, tryFps);
-                trySetJpegQualityMax(gFd);
-
-                int got = readFps(gFd, tryFps);
-
-                // kritik: aktif fourcc ile MJPEG/YUYV ayrımı doğru çalışsın
-                applyControls(gFd, got, fmt.fmt.pix.pixelformat);
-
-                const long long area =
-                        (long long)fmt.fmt.pix.width * (long long)fmt.fmt.pix.height;
-                const long long bestArea =
-                        (long long)localBestW * (long long)localBestH;
-
-                // seçim: önce çözünürlük (area), sonra fps
-                if (!okLocal || area > bestArea || (area == bestArea && got > localBestGotFps)) {
-                    okLocal = true;
-                    localBestGotFps = got;
-                    localBestFmt = fmt;
-                    localBestW = (int)fmt.fmt.pix.width;
-                    localBestH = (int)fmt.fmt.pix.height;
-                    localBestFourcc = fmt.fmt.pix.pixelformat;
-                }
-            }
-
-            if (!okLocal) return false;
-
-            // setupLocked'in dışındaki "best*" değişkenlerine yaz
             ok = true;
-            bestGotFps = localBestGotFps;
-            bestFmt = localBestFmt;
-            bestW = localBestW;
-            bestH = localBestH;
-            bestFourcc = localBestFourcc;
-            return true;
-        };
-
-// 1) Netlik için önce YUYV dene
-        if (UVC_PREFER_YUYV_SHARPNESS) {
-            ok = tryPick(true);
-        }
-
-// 2) YUYV yoksa / seçilemediyse fallback (MJPEG dahil)
-        if (!ok) {
-            ok = tryPick(false);
+            bestGotFps = got;
+            bestFmt = fmt;
+            bestW = (int) fmt.fmt.pix.width;
+            bestH = (int) fmt.fmt.pix.height;
+            bestFourcc = fmt.fmt.pix.pixelformat;
+            break; // En iyi adayı bulduk (liste sıralıydı)
         }
 
         if (!ok) {
@@ -890,23 +844,20 @@ namespace uvc {
         }
 
         (void) trySetFormat(gFd, bestW, bestH, bestFourcc, fmt);
-
         gChosenFps.store(bestGotFps > 0 ? bestGotFps : want, std::memory_order_relaxed);
-
         gW = (int) fmt.fmt.pix.width;
         gH = (int) fmt.fmt.pix.height;
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
 
-        // Crop kapalı → chosenH = gH
         const int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
         gChosenW.store(gW, std::memory_order_relaxed);
         gChosenH.store(cropH, std::memory_order_relaxed);
 
         v4l2_requestbuffers req{};
-        req.count = 12;
+        req.count = 8; // Buffer sayısını 12'den 8'e düşürdüm (YUYV büyük yer kaplar)
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(gFd, VIDIOC_REQBUFS, &req) != 0 || req.count < 4) {
+        if (xioctl(gFd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) {
             setErrLocked("VIDIOC_REQBUFS failed");
             return false;
         }
@@ -917,12 +868,10 @@ namespace uvc {
             b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             b.memory = V4L2_MEMORY_MMAP;
             b.index = i;
-
             if (xioctl(gFd, VIDIOC_QUERYBUF, &b) != 0) {
                 setErrLocked("VIDIOC_QUERYBUF failed");
                 return false;
             }
-
             void *p = mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, gFd, b.m.offset);
             if (p == MAP_FAILED) {
                 setErrLocked("mmap failed");
@@ -930,7 +879,6 @@ namespace uvc {
             }
             gBufs[i].ptr = p;
             gBufs[i].len = b.length;
-
             if (xioctl(gFd, VIDIOC_QBUF, &b) != 0) {
                 setErrLocked("VIDIOC_QBUF failed");
                 return false;
@@ -944,8 +892,9 @@ namespace uvc {
         }
 
         if (gWin) {
-            // Crop kapalı: geometry tam H
-            (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH, WINDOW_FORMAT_RGBA_8888);
+            // Buffer Formatı Back Kamera ile Eşitlendi: RGBA_8888 (Explicit)
+            (void) ANativeWindow_setBuffersGeometry(gWin, gW, cropH,
+                                                    AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
             int fps = gChosenFps.load(std::memory_order_relaxed);
             trySetFrameRate(gWin, (float) (fps > 0 ? fps : want));
         }
@@ -953,7 +902,8 @@ namespace uvc {
         {
             std::lock_guard<std::mutex> lk(gFrameLock);
             size_t cap = 512 * 1024;
-            if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 && gH > 0) {
+            if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
+                gH > 0) {
                 cap = (size_t) gW * (size_t) gH * 2;
             } else if (gW > 0 && gH > 0) {
                 cap = (size_t) gW * (size_t) gH;
@@ -981,7 +931,6 @@ namespace uvc {
 
             long long ts = nowBoottimeNs();
             gLastFrameTsNs.store(ts, std::memory_order_relaxed);
-
             long long prev = gPrevFrameTsNs.exchange(ts, std::memory_order_relaxed);
             if (prev != 0 && ts > prev) {
                 double fps = 1e9 / (double) (ts - prev);
@@ -993,7 +942,9 @@ namespace uvc {
                 const uint8_t *src = (const uint8_t *) gBufs[b.index].ptr;
                 int used = (int) b.bytesused;
 
-                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 && gH > 0) {
+                // AE sadece YUYV için aktif (MJPEG'te donanım AE kullanıyoruz)
+                if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
+                    gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
                     if ((size_t) used >= need) {
                         int avg = avgLumaYuyvSample(src, gW, gH);
@@ -1009,7 +960,6 @@ namespace uvc {
                 }
                 gFrameCv.notify_one();
             }
-
             (void) xioctl(gFd, VIDIOC_QBUF, &b);
         }
         gFrameCv.notify_all();
@@ -1027,7 +977,6 @@ namespace uvc {
                            gFrameReady.load(std::memory_order_relaxed);
                 });
                 if (!gRunning.load(std::memory_order_relaxed)) break;
-
                 local.swap(gFrameBytes);
                 gFrameReady.store(false, std::memory_order_relaxed);
             }
@@ -1035,52 +984,54 @@ namespace uvc {
             if (!gWin || local.empty()) continue;
 
             uint32_t f = gChosenFourcc.load(std::memory_order_relaxed);
-
             int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
             if (cropH <= 0) cropH = 1;
 
+            // YUYV: En temiz, sıkıştırmasız görüntü. Önceliğimiz bu.
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
                     size_t need = (size_t) gW * (size_t) gH * 2;
                     if (local.size() >= need) {
                         cv::Mat yuyv(gH, gW, CV_8UC2, local.data());
-
                         if (rgbaReuse.empty() || rgbaReuse.cols != gW || rgbaReuse.rows != gH) {
                             rgbaReuse = cv::Mat(gH, gW, CV_8UC4);
                         }
+                        // YUY2 -> RGBA dönüşümü
                         cv::cvtColor(yuyv, rgbaReuse, cv::COLOR_YUV2RGBA_YUY2);
 
                         cv::Rect roi(0, 0, gW, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
-                        applyUvcSeamAndEdgeProcessing(cropped);
 
+                        applyUvcSeamAndEdgeProcessing(cropped);
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
                 }
                 continue;
             }
 
+            // MJPEG: Yedek plan. Gürültülü olabilir.
             if (f == V4L2_PIX_FMT_MJPEG) {
                 try {
                     cv::Mat buf(1, (int) local.size(), CV_8UC1, local.data());
                     cv::Mat bgr = cv::imdecode(buf, cv::IMREAD_COLOR);
                     if (!bgr.empty()) {
-                        if (rgbaReuse.empty() || rgbaReuse.cols != bgr.cols || rgbaReuse.rows != bgr.rows) {
+                        if (rgbaReuse.empty() || rgbaReuse.cols != bgr.cols ||
+                            rgbaReuse.rows != bgr.rows) {
                             rgbaReuse = cv::Mat(bgr.rows, bgr.cols, CV_8UC4);
                         }
                         cv::cvtColor(bgr, rgbaReuse, cv::COLOR_BGR2RGBA);
 
-                        int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
-                        autoExposureMaybeAdjust(avg);
+                        // MJPEG modunda AE yazılım yerine donanımda kalsın, luma check sadece info için
+                        // int avg = avgLumaRgbaSample(rgbaReuse.data, rgbaReuse.cols, rgbaReuse.rows);
+                        // autoExposureMaybeAdjust(avg);
 
                         cv::Rect roi(0, 0, bgr.cols, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
                         if (roi.width > rgbaReuse.cols) roi.width = rgbaReuse.cols;
                         cv::Mat cropped = rgbaReuse(roi);
                         applyUvcSeamAndEdgeProcessing(cropped);
-
                         renderRgbaToWindow(cropped.data, cropped.cols, cropped.rows);
                     }
                 } catch (...) {
@@ -1089,6 +1040,7 @@ namespace uvc {
         }
     }
 
+    // ... (start, stop vb. fonksiyonlar aynı) ...
     bool start(JNIEnv *env, jobject surface, int desiredFps) {
         std::lock_guard<std::mutex> lk(gLock);
         clearErrLocked();
@@ -1124,18 +1076,17 @@ namespace uvc {
     void stop() {
         std::lock_guard<std::mutex> lk(gLock);
         if (!gRunning.load(std::memory_order_relaxed)) return;
-
         gRunning.store(false, std::memory_order_relaxed);
         gFrameCv.notify_all();
-
         if (gThCap.joinable()) gThCap.join();
         if (gThDec.joinable()) gThDec.join();
-
         teardownLocked();
     }
 
     long long lastFrameTimestampNs() { return gLastFrameTsNs.load(std::memory_order_relaxed); }
+
     int estimatedFpsX100() { return gFpsX100.load(std::memory_order_relaxed); }
+
     int chosenFps() { return gChosenFps.load(std::memory_order_relaxed); }
 
     std::string lastError() {

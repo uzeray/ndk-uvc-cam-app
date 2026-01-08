@@ -61,10 +61,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         extTv = TextureView(this).apply {
-            setOpaque(false)
             translationY = -30f
         }
-        // backTv.translationZ = 0f
 
 
 
