@@ -39,8 +39,8 @@ class UvcAction(
 
     private var extModeCache: String = ""
     private var extFmtCache: String = ""
-    private var extBufW: Int = 1280
-    private var extBufH: Int = 720
+    private var extBufW: Int = 1920
+    private var extBufH: Int = 1080
 
     private var lastSuInfo: String = ""
     private var lastSuPrepErr: String = ""
@@ -188,7 +188,7 @@ class UvcAction(
         val srcWF = srcW.toFloat()
         val srcHF = srcH.toFloat()
 
-        var kx = 0.50f
+        var kx = 0.495f
         val ky = 1.80f
 
         val TRIM_RIGHT_PX = 15f

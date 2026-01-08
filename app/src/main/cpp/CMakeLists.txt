@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(camcpp)
 
-# OpenCVConfig.cmake burada:
 set(OpenCV_DIR "${CMAKE_SOURCE_DIR}/third_party/OpenCV-android-sdk/sdk/native/jni")
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
@@ -21,12 +20,15 @@ find_library(log-lib log)
 find_library(android-lib android)
 find_library(dl-lib dl)
 find_library(jnigraphics-lib jnigraphics)
+# BU EKLENDİ: Media NDK (AImageReader için gerekli)
+find_library(media-lib mediandk)
 
 target_link_libraries(camcpp
         ${log-lib}
         ${android-lib}
         ${dl-lib}
         ${jnigraphics-lib}
+        ${media-lib}  # BU EKLENDİ
         camera2ndk
         ${OpenCV_LIBS}
 )

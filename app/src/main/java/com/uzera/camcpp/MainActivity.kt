@@ -61,7 +61,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         extTv = TextureView(this).apply {
-            setOpaque(true)
+            setOpaque(false)
             translationY = -30f
         }
         // backTv.translationZ = 0f
@@ -101,28 +101,11 @@ class MainActivity : AppCompatActivity() {
             addView(stack)
         }
 
-        val hud = TextView(this).apply {
-            text = "HUD"
-            setTextColor(0x80FFFFFF.toInt())
-            setBackgroundColor(0x20000000)
-            setPadding(8, 8, 8, 8)
-            textSize = 13f
-            typeface = android.graphics.Typeface.MONOSPACE
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                // top|start
-                gravity = android.view.Gravity.TOP or android.view.Gravity.START
-            }
-        }
-
         root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             clipChildren = true
             clipToPadding = true
             addView(panel)
-            addView(hud)
         }
 
         setContentView(root)

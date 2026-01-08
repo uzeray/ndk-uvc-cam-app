@@ -67,6 +67,13 @@
 #endif
 
 #define UVC_CROP_HEIGHT_RATIO 1.00f
+#ifndef UVC_SEAM_PX
+#define UVC_SEAM_PX 12
+#endif
+
+#ifndef UVC_EDGE_PX
+#define UVC_EDGE_PX 24
+#endif
 
 namespace uvc {
 
@@ -282,8 +289,8 @@ namespace uvc {
         return (uint8_t) (v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 
-    static constexpr int    UVC_SEAM_PX      = 10;   // seam band yüksekliği
-    static constexpr int    UVC_EDGE_PX      = 28;   // kenar keskinleştirme bandı
+    static constexpr bool UVC_PREFER_YUYV_SHARPNESS = true;
+    static constexpr int  UVC_MIN_OK_FPS_FOR_YUYV   = 30;
     static constexpr double UVC_SEAM_SIGMA_X = 2.0;
     static constexpr double UVC_SEAM_SIGMA_Y = 0.8;
     static constexpr double UVC_SHARP_SIGMA  = 1.0;
@@ -337,26 +344,47 @@ namespace uvc {
         if (rr.width <= 0 || rr.height <= 0) return;
 
         cv::Mat roi = rgba(rr);
-        cv::Mat blurred;
-        cv::GaussianBlur(roi, blurred, cv::Size(0, 0), UVC_SHARP_SIGMA);
-        cv::addWeighted(roi, 1.0 + UVC_SHARP_AMOUNT, blurred, -UVC_SHARP_AMOUNT, 0.0, roi);
 
-        // Kenar keskinleştirme bandında alpha'yı tekrar opak yap (seam hariç bölgelerde)
-        setAlphaRect(rgba, rr, 255);
+        // RGBA split -> sadece RGB sharpen, A aynen kalsın
+        std::vector<cv::Mat> ch;
+        cv::split(roi, ch);
+        if (ch.size() != 4) return;
+
+        for (int i = 0; i < 3; ++i) {
+            cv::Mat blurred;
+            cv::GaussianBlur(ch[i], blurred, cv::Size(0, 0), UVC_SHARP_SIGMA);
+            cv::addWeighted(ch[i], 1.0 + UVC_SHARP_AMOUNT, blurred, -UVC_SHARP_AMOUNT, 0.0, ch[i]);
+        }
+
+        cv::merge(ch, roi);
     }
 
     static inline void applyUvcSeamAndEdgeProcessing(cv::Mat& rgba) {
         if (rgba.empty()) return;
 
-        // Seam feather kapalı: tüm frame opak
+        // 1) önce full opak
         setAlphaRect(rgba, cv::Rect(0, 0, rgba.cols, rgba.rows), 255);
 
+        // 2) UVC üst kenarda feather (0 -> 255) + blur
+        const int seamPx = std::min(UVC_SEAM_PX, rgba.rows);
+        if (seamPx > 0) {
+            applyTopSeamFeather(rgba, seamPx);
+        }
+
+        // 3) Kenar sharpen (seam bölgesine dokunma)
         const int edge = std::min(UVC_EDGE_PX, std::min(rgba.cols / 3, rgba.rows / 3));
         if (edge <= 0) return;
 
-        // Kenar sharpen devam edebilir
-        unsharpRect(rgba, cv::Rect(0, 0, edge, rgba.rows));
-        unsharpRect(rgba, cv::Rect(rgba.cols - edge, 0, edge, rgba.rows));
+        const int y0 = seamPx;                         // üst seam sonrası
+        const int h0 = std::max(0, rgba.rows - seamPx); // kalan yükseklik
+
+        if (h0 > 0) {
+            // sol/sağ kenar: seam'i exclude et
+            unsharpRect(rgba, cv::Rect(0, y0, edge, h0));
+            unsharpRect(rgba, cv::Rect(rgba.cols - edge, y0, edge, h0));
+        }
+
+        // alt kenar (tam genişlik)
         unsharpRect(rgba, cv::Rect(0, rgba.rows - edge, rgba.cols, edge));
     }
 
@@ -506,7 +534,7 @@ namespace uvc {
         ANativeWindow_unlockAndPost(gWin);
     }
 
-    static void applyControls(int fd, int chosenFps) {
+    static void applyControls(int fd, int chosenFps, uint32_t activeFourcc) {
         {
             v4l2_queryctrl qc{};
             if (queryCtrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, qc)) {
@@ -537,8 +565,7 @@ namespace uvc {
 
         (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
 
-        const bool isMjpeg = (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_MJPEG);
-
+        const bool isMjpeg = (activeFourcc == V4L2_PIX_FMT_MJPEG);
         trySetJpegQualityMax(fd);
 
         {
@@ -616,7 +643,7 @@ namespace uvc {
                 out.emplace_back(maxW, maxH);
 
                 const std::pair<int, int> common[] = {
-                        {1280,  720}
+                        {1920,  1080}
                 };
                 for (auto &c: common) {
                     if (c.first >= minW && c.first <= maxW && c.second >= minH &&
@@ -679,7 +706,7 @@ namespace uvc {
 
             if (sizes.empty()) {
                 const std::pair<int, int> fallback[] = {
-                        {1280, 720}
+                        {1920, 1080}
                 };
                 sizes.assign(std::begin(fallback), std::end(fallback));
             }
@@ -793,35 +820,68 @@ namespace uvc {
         int bestW = 0, bestH = 0;
         uint32_t bestFourcc = 0;
 
-        for (const auto &c: cands) {
-            if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
+        auto tryPick = [&](bool onlyYuyv) -> bool {
+            bool okLocal = false;
 
-            int tryFps = want;
-            if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
-            trySetFps(gFd, tryFps);
-            trySetJpegQualityMax(gFd);
-            int got = readFps(gFd, tryFps);
+            int localBestGotFps = 0;
+            v4l2_format localBestFmt{};
+            int localBestW = 0, localBestH = 0;
+            uint32_t localBestFourcc = 0;
 
-            applyControls(gFd, got);
+            for (const auto &c : cands) {
+                if (onlyYuyv && c.f != V4L2_PIX_FMT_YUYV) continue;
 
-            if (!ok || (got >= want - 2 && bestGotFps < want - 2) ||
-                ((got >= want - 2) == (bestGotFps >= want - 2) &&
-                 ((long long) fmt.fmt.pix.width * (long long) fmt.fmt.pix.height >
-                  (long long) bestW * (long long) bestH)) ||
-                ((long long) fmt.fmt.pix.width * (long long) fmt.fmt.pix.height ==
-                 (long long) bestW * (long long) bestH && got > bestGotFps)
-                    ) {
-                ok = true;
-                bestGotFps = got;
-                bestFmt = fmt;
-                bestW = (int) fmt.fmt.pix.width;
-                bestH = (int) fmt.fmt.pix.height;
-                bestFourcc = fmt.fmt.pix.pixelformat;
+                // YUYV için: enumMaxFpsFor > 0 ise ve < 30 ise ele
+                if (onlyYuyv && c.maxFps > 0 && c.maxFps < UVC_MIN_OK_FPS_FOR_YUYV) continue;
 
-                if (bestGotFps >= want - 2 && c.scoreMeet == 1) {
-                    break;
+                if (!trySetFormat(gFd, c.w, c.h, c.f, fmt)) continue;
+
+                int tryFps = want;
+                if (c.maxFps > 0) tryFps = std::min(tryFps, c.maxFps);
+                trySetFps(gFd, tryFps);
+                trySetJpegQualityMax(gFd);
+
+                int got = readFps(gFd, tryFps);
+
+                // kritik: aktif fourcc ile MJPEG/YUYV ayrımı doğru çalışsın
+                applyControls(gFd, got, fmt.fmt.pix.pixelformat);
+
+                const long long area =
+                        (long long)fmt.fmt.pix.width * (long long)fmt.fmt.pix.height;
+                const long long bestArea =
+                        (long long)localBestW * (long long)localBestH;
+
+                // seçim: önce çözünürlük (area), sonra fps
+                if (!okLocal || area > bestArea || (area == bestArea && got > localBestGotFps)) {
+                    okLocal = true;
+                    localBestGotFps = got;
+                    localBestFmt = fmt;
+                    localBestW = (int)fmt.fmt.pix.width;
+                    localBestH = (int)fmt.fmt.pix.height;
+                    localBestFourcc = fmt.fmt.pix.pixelformat;
                 }
             }
+
+            if (!okLocal) return false;
+
+            // setupLocked'in dışındaki "best*" değişkenlerine yaz
+            ok = true;
+            bestGotFps = localBestGotFps;
+            bestFmt = localBestFmt;
+            bestW = localBestW;
+            bestH = localBestH;
+            bestFourcc = localBestFourcc;
+            return true;
+        };
+
+// 1) Netlik için önce YUYV dene
+        if (UVC_PREFER_YUYV_SHARPNESS) {
+            ok = tryPick(true);
+        }
+
+// 2) YUYV yoksa / seçilemediyse fallback (MJPEG dahil)
+        if (!ok) {
+            ok = tryPick(false);
         }
 
         if (!ok) {
