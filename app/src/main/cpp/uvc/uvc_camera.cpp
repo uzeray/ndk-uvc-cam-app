@@ -39,6 +39,16 @@
 #define V4L2_CID_AUTOGAIN 0x00980913
 #endif
 
+#ifndef V4L2_CID_BACKLIGHT_COMPENSATION
+#define V4L2_CID_BACKLIGHT_COMPENSATION 0x0098091c
+#endif
+#ifndef V4L2_CID_SHARPNESS
+#define V4L2_CID_SHARPNESS 0x0098091b
+#endif
+#ifndef V4L2_CID_GAMMA
+#define V4L2_CID_GAMMA 0x00980910
+#endif
+
 #ifndef V4L2_EXPOSURE_AUTO
 #define V4L2_EXPOSURE_AUTO 0
 #endif
@@ -365,19 +375,6 @@ namespace uvc {
         if (seamPx > 0) {
             applyTopSeamFeather(rgba, seamPx);
         }
-
-        const int edge = std::min(UVC_EDGE_PX, std::min(rgba.cols / 3, rgba.rows / 3));
-        if (edge <= 0) return;
-
-        const int y0 = seamPx;
-        const int h0 = std::max(0, rgba.rows - seamPx);
-
-        if (h0 > 0) {
-            unsharpRect(rgba, cv::Rect(0, y0, edge, h0));
-            unsharpRect(rgba, cv::Rect(rgba.cols - edge, y0, edge, h0));
-        }
-
-        unsharpRect(rgba, cv::Rect(0, rgba.rows - edge, rgba.cols, edge));
     }
 
 
@@ -553,6 +550,29 @@ namespace uvc {
             if (queryCtrl(fd, V4L2_CID_SATURATION, qc)) {
                 (void) setCtrl(fd, V4L2_CID_SATURATION, (int) qc.default_value);
             }
+        }
+
+        {
+            v4l2_queryctrl qc{};
+            qc.id = V4L2_CID_SHARPNESS;
+            if (xioctl(fd, VIDIOC_QUERYCTRL, &qc) == 0) {
+                setCtrl(fd, V4L2_CID_SHARPNESS, 50);
+            }
+        }
+
+        {
+            v4l2_queryctrl qc{};
+            qc.id = V4L2_CID_GAMMA;
+            if (xioctl(fd, VIDIOC_QUERYCTRL, &qc) == 0) {
+                setCtrl(fd, V4L2_CID_GAMMA, (int) qc.default_value);
+            }
+        }
+
+        {
+            v4l2_control c{};
+            c.id = V4L2_CID_BACKLIGHT_COMPENSATION;
+            c.value = 0;
+            xioctl(fd, VIDIOC_S_CTRL, &c);
         }
 
         (void) setCtrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, 1);
