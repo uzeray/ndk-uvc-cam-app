@@ -61,13 +61,13 @@
 #endif
 
 #ifndef UVC_AE_TARGET_LUMA
-#define UVC_AE_TARGET_LUMA 126
+#define UVC_AE_TARGET_LUMA 124
 #endif
 #ifndef UVC_AE_TOL
-#define UVC_AE_TOL 10
+#define UVC_AE_TOL 15
 #endif
 #ifndef UVC_AE_ADJUST_INTERVAL_MS
-#define UVC_AE_ADJUST_INTERVAL_MS 60
+#define UVC_AE_ADJUST_INTERVAL_MS 100
 #endif
 #ifndef UVC_AE_MAX_EXPOSURE_US_CAP
 #define UVC_AE_MAX_EXPOSURE_US_CAP 16000
@@ -113,6 +113,7 @@ namespace uvc {
     static std::atomic<int> gChosenH{0};
 
     static int gW = 0, gH = 0;
+    static std::atomic<int> gBytesPerLine{0};
 
     static std::mutex gFrameLock;
     static std::condition_variable gFrameCv;
@@ -307,6 +308,7 @@ namespace uvc {
 
     static constexpr double UVC_SHARP_SIGMA = 1.0;
     static constexpr double UVC_SHARP_AMOUNT = 0.25;
+    static constexpr int UVC_GAIN_MAX_CLAMP = 64; // conservative; raise only if too dark
 
     static inline void setAlphaRect(cv::Mat &rgba, const cv::Rect &r, uint8_t a) {
         if (rgba.empty()) return;
@@ -378,16 +380,21 @@ namespace uvc {
     }
 
 
-    static int avgLumaYuyvSample(const uint8_t *yuyv, int w, int h) {
+    static int avgLumaYuyvSample(const uint8_t *yuyv, int w, int h, int bytesPerLine) {
         if (!yuyv || w <= 0 || h <= 0) return 0;
+        if (bytesPerLine <= 0) bytesPerLine = w * 2;
+
         const int stepX = std::max(1, w / 64);
         const int stepY = std::max(1, h / 36);
-        const int stride = w * 2;
+
         long long sum = 0;
         int cnt = 0;
+
         for (int y = 0; y < h; y += stepY) {
-            const uint8_t *row = yuyv + y * stride;
+            const uint8_t *row = yuyv + (size_t) y * (size_t) bytesPerLine;
             for (int x = 0; x < w; x += stepX) {
+                // In packed YUYV family, Y is at even byte offsets per pixel pair.
+                // For sampling, row[2*x] works as long as row is aligned to the packed format.
                 sum += (int) row[2 * x];
                 cnt++;
             }
@@ -449,6 +456,7 @@ namespace uvc {
 
         int curExp = gCurExpAbs.load(std::memory_order_relaxed);
         int curGain = gCurGain.load(std::memory_order_relaxed);
+        int gainMaxEff = gGain.ok ? std::min(gGain.maxV, UVC_GAIN_MAX_CLAMP) : 0;
 
         if (gExpAbs.ok && curExp == 0) {
             int v = 0;
@@ -483,8 +491,11 @@ namespace uvc {
                     curExp = next;
                     changed = true;
                 }
-            } else if (gGain.ok && curGain < gGain.maxV) {
-                int next = clampToRange(gGain, curGain + gGain.step);
+            } else if (gGain.ok && gainMaxEff > 0 && curGain < gainMaxEff) {
+                int step = std::max(1, gGain.step);
+                int next = clampToRange(gGain, curGain + step);
+                next = std::min(next, gainMaxEff);
+                next = clampToRange(gGain, next);
                 if (next != curGain && setCtrl(gFd, V4L2_CID_GAIN, next)) {
                     curGain = next;
                     changed = true;
@@ -723,8 +734,8 @@ namespace uvc {
             bool bIsYuyv = (b.f == V4L2_PIX_FMT_YUYV);
             if (aIsYuyv != bIsYuyv) return aIsYuyv > bIsYuyv;
 
-            if (a.w != b.w) return a.w < b.w;
-            return a.h < b.h;
+            if (a.w != b.w) return a.w > b.w;
+            return a.h > b.h;
         });
 
         out.erase(std::unique(out.begin(), out.end(), [](const ModeCand &a, const ModeCand &b) {
@@ -839,6 +850,7 @@ namespace uvc {
         gW = (int) fmt.fmt.pix.width;
         gH = (int) fmt.fmt.pix.height;
         gChosenFourcc.store(fmt.fmt.pix.pixelformat, std::memory_order_relaxed);
+        gBytesPerLine.store((int) fmt.fmt.pix.bytesperline, std::memory_order_relaxed);
 
         const int cropH = (int) (gH * UVC_CROP_HEIGHT_RATIO);
         gChosenW.store(gW, std::memory_order_relaxed);
@@ -894,7 +906,9 @@ namespace uvc {
             size_t cap = 512 * 1024;
             if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
                 gH > 0) {
-                cap = (size_t) gW * (size_t) gH * 2;
+                int bpl = gBytesPerLine.load(std::memory_order_relaxed);
+                if (bpl <= 0) bpl = gW * 2;
+                cap = (size_t) bpl * (size_t) gH;
             } else if (gW > 0 && gH > 0) {
                 cap = (size_t) gW * (size_t) gH;
             }
@@ -934,9 +948,12 @@ namespace uvc {
 
                 if (gChosenFourcc.load(std::memory_order_relaxed) == V4L2_PIX_FMT_YUYV && gW > 0 &&
                     gH > 0) {
-                    size_t need = (size_t) gW * (size_t) gH * 2;
+                    int bpl = gBytesPerLine.load(std::memory_order_relaxed);
+                    if (bpl <= 0) bpl = gW * 2;
+                    size_t need = (size_t) bpl * (size_t) gH;
+
                     if ((size_t) used >= need) {
-                        int avg = avgLumaYuyvSample(src, gW, gH);
+                        int avg = avgLumaYuyvSample(src, gW, gH, bpl);
                         autoExposureMaybeAdjust(avg);
                     }
                 }
@@ -978,13 +995,35 @@ namespace uvc {
 
             if (f == V4L2_PIX_FMT_YUYV) {
                 if (gW > 0 && gH > 0) {
-                    size_t need = (size_t) gW * (size_t) gH * 2;
+                    int bpl = gBytesPerLine.load(std::memory_order_relaxed);
+                    if (bpl <= 0) bpl = gW * 2;
+
+                    size_t need = (size_t) bpl * (size_t) gH;
                     if (local.size() >= need) {
-                        cv::Mat yuyv(gH, gW, CV_8UC2, local.data());
+                        cv::Mat yuv(gH, gW, CV_8UC2, local.data(), (size_t) bpl);
+
                         if (rgbaReuse.empty() || rgbaReuse.cols != gW || rgbaReuse.rows != gH) {
                             rgbaReuse = cv::Mat(gH, gW, CV_8UC4);
                         }
-                        cv::cvtColor(yuyv, rgbaReuse, cv::COLOR_YUV2RGBA_YUY2);
+
+                        const uint32_t pix = gChosenFourcc.load(std::memory_order_relaxed);
+                        int code = -1;
+                        switch (pix) {
+                            case V4L2_PIX_FMT_YUYV:
+                                code = cv::COLOR_YUV2RGBA_YUY2;
+                                break;
+                            case V4L2_PIX_FMT_UYVY:
+                                code = cv::COLOR_YUV2RGBA_UYVY;
+                                break;
+                            case V4L2_PIX_FMT_YVYU:
+                                code = cv::COLOR_YUV2RGBA_YVYU;
+                                break;
+                            default:
+                                code = cv::COLOR_YUV2RGBA_YUY2;
+                                break; // fallback
+                        }
+
+                        cv::cvtColor(yuv, rgbaReuse, code);
 
                         cv::Rect roi(0, 0, gW, cropH);
                         if (roi.height > rgbaReuse.rows) roi.height = rgbaReuse.rows;
