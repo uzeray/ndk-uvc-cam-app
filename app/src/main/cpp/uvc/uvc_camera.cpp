@@ -348,26 +348,6 @@ namespace uvc {
         }
     }
 
-    static inline void unsharpRect(cv::Mat &rgba, const cv::Rect &r) {
-        if (rgba.empty()) return;
-        cv::Rect rr = r & cv::Rect(0, 0, rgba.cols, rgba.rows);
-        if (rr.width <= 0 || rr.height <= 0) return;
-
-        cv::Mat roi = rgba(rr);
-
-        std::vector<cv::Mat> ch;
-        cv::split(roi, ch);
-        if (ch.size() != 4) return;
-
-        for (int i = 0; i < 3; ++i) {
-            cv::Mat blurred;
-            cv::GaussianBlur(ch[i], blurred, cv::Size(0, 0), UVC_SHARP_SIGMA);
-            cv::addWeighted(ch[i], 1.0 + UVC_SHARP_AMOUNT, blurred, -UVC_SHARP_AMOUNT, 0.0, ch[i]);
-        }
-
-        cv::merge(ch, roi);
-    }
-
     static inline void applyUvcSeamAndEdgeProcessing(cv::Mat &rgba) {
         if (rgba.empty()) return;
 
@@ -396,26 +376,6 @@ namespace uvc {
                 // In packed YUYV family, Y is at even byte offsets per pixel pair.
                 // For sampling, row[2*x] works as long as row is aligned to the packed format.
                 sum += (int) row[2 * x];
-                cnt++;
-            }
-        }
-        return cnt ? (int) (sum / cnt) : 0;
-    }
-
-    static int avgLumaRgbaSample(const uint8_t *rgba, int w, int h) {
-        if (!rgba || w <= 0 || h <= 0) return 0;
-        const int stepX = std::max(1, w / 64);
-        const int stepY = std::max(1, h / 36);
-        const int stride = w * 4;
-        long long sum = 0;
-        int cnt = 0;
-        for (int y = 0; y < h; y += stepY) {
-            const uint8_t *row = rgba + y * stride;
-            for (int x = 0; x < w; x += stepX) {
-                const uint8_t *p = row + x * 4;
-                int R = p[0], G = p[1], B = p[2];
-                int Y = (77 * R + 150 * G + 29 * B) >> 8;
-                sum += Y;
                 cnt++;
             }
         }
